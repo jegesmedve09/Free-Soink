@@ -1,0 +1,26 @@
+00 air
+01 floor
+02 coin
+03 PC w coin
+04 PC w life
+05 enemy crab bot
+06 enemy bee bot
+07 enemy motobug
+08 enemy drone
+09 enemy fish
+0A enemy 2 wheeled crab bot shit
+0B enemy blue 2 wheeled crab bot shit
+0C enemy boom boom penguin
+0D enemy springy 2 wheeled crab bot shit
+0E enemy blue springy 2 wheeled crab bot shit
+0F enemy that springy mini robonik
+10 enemy squid shit
+11 enemy moving yellow one wheeled shit
+12 spike
+13 sprint upward
+14 high momentum field shit
+15 hidden 10 up
+16 hidden 100 up
+17 hidden 1000 up
+18 MEGA COIN
+

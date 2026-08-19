@@ -1,0 +1,730 @@
+import pygame
+import sys
+import tkinter as tk
+from tkinter import filedialog
+
+pygame.init()
+
+root = tk.Tk()
+root.withdraw()
+root.update()
+
+WIDTH, HEIGHT = 320, 224
+UI_WIDTH = 340
+WIN_WIDTH = (WIDTH * 3) + UI_WIDTH
+WIN_HEIGHT = 760
+
+screen = pygame.display.set_mode((WIN_WIDTH, WIN_HEIGHT), pygame.RESIZABLE)
+pygame.display.set_caption("Green Mountain Zone - Retro Level Paint Tool")
+clock = pygame.time.Clock()
+
+# ---------- Palette ----------
+raw_data = """
+000 020 040 060 080 0A0 0C0 0E0
+002 022 042 062 082 0A2 0C2 0E2
+004 024 044 064 084 0A4 0C4 0E4
+006 026 046 066 086 0A6 0C6 0E6
+008 028 048 068 088 0A8 0C8 0E8
+00A 02A 04A 06A 08A 0AA 0CA 0EA
+00C 02C 04C 06C 08C 0AC 0CC 0EC
+00E 02E 04E 06E 08E 0AE 0CE 0EE
+400 420 440 460 480 4A0 4C0 4E0
+402 422 442 462 482 4A2 4C2 4E2
+404 424 444 464 484 4A4 4C4 4E4
+406 426 446 466 486 4A6 4C6 4E6
+408 428 448 468 488 4A8 4C8 4E8
+40A 42A 44A 46A 48A 4AA 4CA 4EA
+40C 42C 44C 46C 48C 4AC 4CC 4EC
+40E 42E 44E 46E 48E 4AE 4CE 4EE
+800 820 840 860 880 8A0 8C0 8E0
+802 822 842 862 882 8A2 8C2 8E2
+804 824 844 864 884 8A4 8C4 8E4
+806 826 846 866 886 8A6 8C6 8E6
+808 828 848 868 888 8A8 8C8 8E8
+80A 82A 84A 86A 88A 8AA 8CA 8EA
+80C 82C 84C 86C 88C 8AC 8CC 8EC
+80E 82E 84E 86E 88E 8AE 8CE 8EE
+C00 C20 C40 C60 C80 CA0 CC0 CE0
+C02 C22 C42 C62 C82 CA2 CC2 CE2
+C04 C24 C44 C64 C84 CA4 CC4 CE4
+C06 C26 C46 C66 C86 CA6 CC6 CE6
+C08 C28 C48 C68 C88 CA8 CC8 CE8
+C0A C2A C4A C6A C8A CAA CCA CEA
+C0C C2C C4C C6C C8C CAC CCC CEC
+C0E C2E C4E C6E C8E CAE CCE CEE
+"""
+tokens = raw_data.split()
+palette_rgb = []
+for token in tokens:
+    r = int(token[0], 16) << 4
+    g = int(token[1], 16) << 4
+    b = int(token[2], 16) << 4
+    palette_rgb.append((r, g, b))
+while len(palette_rgb) < 256:
+    palette_rgb.append((0, 0, 0))
+
+# ---------- Editor state ----------
+canvas_data = bytearray(WIDTH * HEIGHT)
+current_color_index = 0
+zoom = 3
+MAX_ZOOM = 64
+SCALED_THRESHOLD = 16
+camera_x = 20
+camera_y = 20
+current_filename = "0,0.lvl"
+
+current_tool = "draw"
+selection_start = None
+selection_box = None         # [x, y, w, h]
+clipboard = None
+
+is_pasting = False
+paste_x = 0
+paste_y = 0
+
+# ---- Move selection state ----
+is_moving = False
+move_buffer = None
+move_x = 0
+move_y = 0
+grab_ox = 0
+grab_oy = 0
+
+dragging_v_scroll = False
+dragging_h_scroll = False
+
+font = pygame.font.SysFont(None, 20)
+font_small = pygame.font.SysFont(None, 18)    # for the size label
+
+# ---------- Surfaces ----------
+canvas_surf = pygame.Surface((WIDTH, HEIGHT))
+scaled_surf = None
+last_zoom = -1
+
+def rebuild_canvas_surf():
+    pxarray = pygame.PixelArray(canvas_surf)
+    for y in range(HEIGHT):
+        for x in range(WIDTH):
+            idx = canvas_data[y * WIDTH + x]
+            pxarray[x, y] = palette_rgb[idx]
+    del pxarray
+
+def rebuild_scaled_surf():
+    global scaled_surf, last_zoom
+    if zoom > SCALED_THRESHOLD:
+        scaled_surf = None
+        last_zoom = zoom
+        return
+    scaled_surf = pygame.transform.scale(canvas_surf, (WIDTH * zoom, HEIGHT * zoom))
+    last_zoom = zoom
+
+def set_pixel(x, y, color_idx):
+    if not (0 <= x < WIDTH and 0 <= y < HEIGHT):
+        return
+    canvas_data[y * WIDTH + x] = color_idx
+    color = palette_rgb[color_idx]
+    canvas_surf.set_at((x, y), color)
+    if scaled_surf is not None and last_zoom == zoom and zoom <= SCALED_THRESHOLD:
+        scaled_surf.fill(color, (x * zoom, y * zoom, zoom, zoom))
+
+def flood_fill(x, y, new_color):
+    """Scanline flood fill algorithm."""
+    target_color = canvas_data[y * WIDTH + x]
+    if target_color == new_color:
+        return
+
+    stack = [(x, y)]
+    while stack:
+        cx, cy = stack.pop()
+        if not (0 <= cx < WIDTH and 0 <= cy < HEIGHT):
+            continue
+        if canvas_data[cy * WIDTH + cx] != target_color:
+            continue
+
+        # Find left bound of the span
+        x1 = cx
+        while x1 >= 0 and canvas_data[cy * WIDTH + x1] == target_color:
+            x1 -= 1
+        x1 += 1
+
+        # Find right bound of the span
+        x2 = cx
+        while x2 < WIDTH and canvas_data[cy * WIDTH + x2] == target_color:
+            x2 += 1
+        x2 -= 1
+
+        # Fill the horizontal span
+        for px in range(x1, x2 + 1):
+            canvas_data[cy * WIDTH + px] = new_color
+
+        # Check rows above and below for new seed spans
+        for y_dir in (-1, 1):
+            ny = cy + y_dir
+            if 0 <= ny < HEIGHT:
+                in_span = False
+                for px in range(x1, x2 + 1):
+                    if canvas_data[ny * WIDTH + px] == target_color:
+                        if not in_span:
+                            stack.append((px, ny))
+                            in_span = True
+                    else:
+                        in_span = False
+
+    rebuild_canvas_surf()
+    rebuild_scaled_surf()
+
+def clamp_camera():
+    global camera_x, camera_y
+    w_width, w_height = screen.get_size()
+    canvas_view_width = w_width - UI_WIDTH
+    total_w = WIDTH * zoom
+    total_h = HEIGHT * zoom
+
+    min_x = -total_w + 50
+    max_x = canvas_view_width - 50
+    min_y = -total_h + 50
+    max_y = w_height - 50
+
+    camera_x = max(min_x, min(max_x, camera_x))
+    camera_y = max(min_y, min(max_y, camera_y))
+
+def update_v_scroll_from_mouse(my):
+    global camera_y
+    _, w_height = screen.get_size()
+    sb_size = 14
+    track_h = w_height - sb_size
+    total_h = HEIGHT * zoom
+    if total_h > w_height:
+        rel_y = max(0, min(track_h, my))
+        fraction = rel_y / track_h
+        camera_y = int(-fraction * (total_h - w_height))
+        clamp_camera()
+
+def update_h_scroll_from_mouse(mx):
+    global camera_x
+    w_width, _ = screen.get_size()
+    canvas_view_width = w_width - UI_WIDTH
+    sb_size = 14
+    track_w = canvas_view_width - sb_size
+    total_w = WIDTH * zoom
+    if total_w > canvas_view_width:
+        rel_x = max(0, min(track_w, mx))
+        fraction = rel_x / track_w
+        camera_x = int(-fraction * (total_w - canvas_view_width))
+        clamp_camera()
+
+def open_level_dialog():
+    global canvas_data, current_filename, selection_box, is_pasting, is_moving
+    filepath = filedialog.askopenfilename(
+        master=root,
+        title="Open Level File",
+        defaultextension=".lvl",
+        filetypes=[("Level Files", "*.lvl"), ("All Files", "*.*")]
+    )
+    if filepath:
+        try:
+            with open(filepath, "rb") as f:
+                data = f.read()
+                if len(data) == WIDTH * HEIGHT:
+                    canvas_data = bytearray(data)
+                    current_filename = filepath
+                    selection_box = None
+                    is_pasting = False
+                    is_moving = False
+                    rebuild_canvas_surf()
+                    rebuild_scaled_surf()
+                    print(f"Successfully loaded: {filepath}")
+                else:
+                    print(f"Error: Size mismatch! Expected {WIDTH*HEIGHT} bytes, got {len(data)}.")
+        except Exception as e:
+            print(f"Failed to open file: {e}")
+
+def save_level_dialog(save_as=False):
+    global current_filename
+    filepath = current_filename
+    if save_as or current_filename == "0,0.lvl":
+        filepath = filedialog.asksaveasfilename(
+            master=root,
+            title="Save Level File As",
+            defaultextension=".lvl",
+            initialfile=current_filename,
+            filetypes=[("Level Files", "*.lvl"), ("All Files", "*.*")]
+        )
+    if filepath:
+        try:
+            with open(filepath, "wb") as f:
+                f.write(canvas_data)
+            current_filename = filepath
+            print(f"Successfully saved to: {filepath}")
+        except Exception as e:
+            print(f"Failed to save file: {e}")
+
+def copy_selection():
+    global clipboard
+    if not selection_box:
+        print("No selection to copy!")
+        return
+    sx, sy, sw, sh = selection_box
+    clip_data = []
+    for py in range(sh):
+        for px in range(sw):
+            cx = sx + px
+            cy = sy + py
+            if 0 <= cx < WIDTH and 0 <= cy < HEIGHT:
+                clip_data.append(canvas_data[cy * WIDTH + cx])
+            else:
+                clip_data.append(0)
+    clipboard = {'w': sw, 'h': sh, 'data': clip_data}
+    print(f"Copied selection of size {sw}x{sh} to clipboard.")
+
+def cut_selection():
+    if not selection_box:
+        print("No selection to cut!")
+        return
+    copy_selection()
+    sx, sy, sw, sh = selection_box
+    for py in range(sh):
+        for px in range(sw):
+            set_pixel(sx + px, sy + py, 0)
+    print("Cut selection (cleared pixels).")
+
+def start_paste():
+    global is_pasting, paste_x, paste_y
+    if not clipboard:
+        print("Clipboard is empty!")
+        return
+    is_pasting = True
+    paste_x = 0
+    paste_y = 0
+    print("Paste mode active. Click or press Enter to stamp.")
+
+def commit_paste():
+    global is_pasting
+    if is_pasting and clipboard:
+        pw = clipboard['w']
+        ph = clipboard['h']
+        pdata = clipboard['data']
+        for py in range(ph):
+            for px in range(pw):
+                set_pixel(paste_x + px, paste_y + py, pdata[py * pw + px])
+        is_pasting = False
+        print("Stamped selection to canvas.")
+
+def start_move(mx, my):
+    global is_moving, move_buffer, move_x, move_y, grab_ox, grab_oy, selection_box
+    if not selection_box:
+        return
+    sx, sy, sw, sh = selection_box
+    if not (sx <= mx < sx + sw and sy <= my < sy + sh):
+        return
+
+    data = []
+    for py in range(sh):
+        for px in range(sw):
+            cx = sx + px
+            cy = sy + py
+            if 0 <= cx < WIDTH and 0 <= cy < HEIGHT:
+                data.append(canvas_data[cy * WIDTH + cx])
+            else:
+                data.append(0)
+    move_buffer = {'w': sw, 'h': sh, 'data': data}
+
+    for py in range(sh):
+        for px in range(sw):
+            set_pixel(sx + px, sy + py, 0)
+
+    is_moving = True
+    move_x = sx
+    move_y = sy
+    grab_ox = mx - sx
+    grab_oy = my - sy
+    selection_box = None
+    print("Moving selection…")
+
+def commit_move():
+    global is_moving, selection_box
+    if not is_moving or not move_buffer:
+        return
+    pw = move_buffer['w']
+    ph = move_buffer['h']
+    pdata = move_buffer['data']
+    for py in range(ph):
+        for px in range(pw):
+            set_pixel(move_x + px, move_y + py, pdata[py * pw + px])
+    selection_box = [move_x, move_y, pw, ph]
+    is_moving = False
+    print("Selection moved.")
+
+def draw_size_label(x, y, w, h, color=(0, 255, 255)):
+    label = f"{w}×{h}"
+    text_surf = font_small.render(label, True, color)
+    bg_rect = text_surf.get_rect()
+    bg_rect.topleft = (x, y - 18)
+    bg_rect.inflate_ip(6, 4)
+    pygame.draw.rect(screen, (20, 20, 20), bg_rect)
+    pygame.draw.rect(screen, color, bg_rect, 1)
+    screen.blit(text_surf, (x + 3, y - 16))
+
+# Initial surfaces
+rebuild_canvas_surf()
+rebuild_scaled_surf()
+
+# Try loading default file
+try:
+    with open(current_filename, "rb") as f:
+        data = f.read()
+        if len(data) == WIDTH * HEIGHT:
+            canvas_data = bytearray(data)
+            rebuild_canvas_surf()
+            rebuild_scaled_surf()
+except FileNotFoundError:
+    pass
+
+running = True
+while running:
+    mouse_x, mouse_y = pygame.mouse.get_pos()
+    pressed = pygame.mouse.get_pressed()
+    mods = pygame.key.get_mods()
+    w_width, w_height = screen.get_size()
+    canvas_view_width = w_width - UI_WIDTH
+
+    canvas_pixel_x = (mouse_x - camera_x) // zoom
+    canvas_pixel_y = (mouse_y - camera_y) // zoom
+
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+
+        elif event.type == pygame.VIDEORESIZE:
+            new_w = max(event.w, UI_WIDTH + 200)
+            new_h = max(event.h, 400)
+            screen = pygame.display.set_mode((new_w, new_h), pygame.RESIZABLE)
+            clamp_camera()
+
+        elif event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_t:
+                if current_tool == "draw":
+                    current_tool = "select"
+                elif current_tool == "select":
+                    current_tool = "eraser"
+                elif current_tool == "eraser":
+                    current_tool = "bucket"
+                else:
+                    current_tool = "draw"
+                print(f"Switched tool to: {current_tool}")
+            elif event.key == pygame.K_s and (mods & pygame.KMOD_CTRL):
+                save_level_dialog(save_as=True)
+            elif event.key == pygame.K_s:
+                save_level_dialog(save_as=False)
+            elif event.key == pygame.K_o:
+                open_level_dialog()
+            elif event.key == pygame.K_c and (mods & pygame.KMOD_CTRL):
+                copy_selection()
+            elif event.key == pygame.K_x and (mods & pygame.KMOD_CTRL):
+                cut_selection()
+            elif event.key == pygame.K_v and (mods & pygame.KMOD_CTRL):
+                start_paste()
+            elif event.key == pygame.K_RETURN:
+                if is_pasting:
+                    commit_paste()
+            elif event.key == pygame.K_ESCAPE:
+                if is_pasting:
+                    is_pasting = False
+                    print("Paste canceled.")
+                elif is_moving:
+                    commit_move()
+                else:
+                    selection_box = None
+                    print("Selection cleared.")
+            elif event.key == pygame.K_c:
+                canvas_data = bytearray(WIDTH * HEIGHT)
+                rebuild_canvas_surf()
+                rebuild_scaled_surf()
+                print("Canvas cleared.")
+
+        elif event.type == pygame.MOUSEBUTTONDOWN:
+            sb_size = 14
+            v_track_rect = pygame.Rect(canvas_view_width - sb_size, 0, sb_size, w_height - sb_size)
+            h_track_rect = pygame.Rect(0, w_height - sb_size, canvas_view_width - sb_size, sb_size)
+
+            if event.button == 1:
+                if v_track_rect.collidepoint(mouse_x, mouse_y):
+                    dragging_v_scroll = True
+                    update_v_scroll_from_mouse(mouse_y)
+                elif h_track_rect.collidepoint(mouse_x, mouse_y):
+                    dragging_h_scroll = True
+                    update_h_scroll_from_mouse(mouse_x)
+                elif mouse_x < canvas_view_width:
+                    if (selection_box and
+                        (mods & pygame.KMOD_CTRL) and (mods & pygame.KMOD_ALT) and
+                        not is_pasting and not is_moving):
+                        start_move(canvas_pixel_x, canvas_pixel_y)
+                    elif is_pasting:
+                        commit_paste()
+                    elif current_tool == "bucket" and not is_moving:
+                        if 0 <= canvas_pixel_x < WIDTH and 0 <= canvas_pixel_y < HEIGHT:
+                            flood_fill(canvas_pixel_x, canvas_pixel_y, current_color_index)
+                    elif current_tool == "select" and not is_moving:
+                        selection_start = (canvas_pixel_x, canvas_pixel_y)
+                        selection_box = None
+                else:
+                    ui_start_x = canvas_view_width
+                    rel_ui_x = mouse_x - ui_start_x
+
+                    swatch_start_x = 15
+                    swatch_start_y = 230
+                    cell_size = 18
+                    rel_swatch_x = rel_ui_x - swatch_start_x
+                    rel_swatch_y = mouse_y - swatch_start_y
+                    if 0 <= rel_swatch_x < (16 * cell_size) and 0 <= rel_swatch_y < (16 * cell_size):
+                        c_idx = rel_swatch_x // cell_size
+                        r_idx = rel_swatch_y // cell_size
+                        clicked_index = (r_idx * 16) + c_idx
+                        if 0 <= clicked_index < 256:
+                            current_color_index = clicked_index
+
+                    btn_y_start = w_height - 110
+                    if 15 <= rel_ui_x <= UI_WIDTH - 15:
+                        if btn_y_start <= mouse_y <= btn_y_start + 30:
+                            open_level_dialog()
+                        elif btn_y_start + 35 <= mouse_y <= btn_y_start + 65:
+                            save_level_dialog(save_as=False)
+                        elif btn_y_start + 70 <= mouse_y <= btn_y_start + 100:
+                            save_level_dialog(save_as=True)
+
+        elif event.type == pygame.MOUSEBUTTONUP:
+            if event.button == 1:
+                dragging_v_scroll = False
+                dragging_h_scroll = False
+
+                if is_moving:
+                    commit_move()
+                elif current_tool == "select" and selection_start:
+                    end_x, end_y = canvas_pixel_x, canvas_pixel_y
+                    sx = min(selection_start[0], end_x)
+                    sy = min(selection_start[1], end_y)
+                    sw = abs(end_x - selection_start[0]) + 1
+                    sh = abs(end_y - selection_start[1]) + 1
+                    sx = max(0, min(WIDTH - 1, sx))
+                    sy = max(0, min(HEIGHT - 1, sy))
+                    sw = min(WIDTH - sx, sw)
+                    sh = min(HEIGHT - sy, sh)
+                    selection_box = [sx, sy, sw, sh]
+                    selection_start = None
+
+        elif event.type == pygame.MOUSEMOTION:
+            if dragging_v_scroll:
+                update_v_scroll_from_mouse(mouse_y)
+            elif dragging_h_scroll:
+                update_h_scroll_from_mouse(mouse_x)
+            elif event.buttons[1]:
+                camera_x += event.rel[0]
+                camera_y += event.rel[1]
+                clamp_camera()
+            elif is_moving:
+                move_x = canvas_pixel_x - grab_ox
+                move_y = canvas_pixel_y - grab_oy
+            elif is_pasting:
+                paste_x = canvas_pixel_x
+                paste_y = canvas_pixel_y
+            elif current_tool == "select" and pressed[0] and selection_start:
+                end_x, end_y = canvas_pixel_x, canvas_pixel_y
+                sx = min(selection_start[0], end_x)
+                sy = min(selection_start[1], end_y)
+                sw = abs(end_x - selection_start[0]) + 1
+                sh = abs(end_y - selection_start[1]) + 1
+                selection_box = [sx, sy, sw, sh]
+
+        elif event.type == pygame.MOUSEWHEEL:
+            if mouse_x < canvas_view_width:
+                if mods & pygame.KMOD_CTRL:
+                    old_zoom = zoom
+                    zoom = max(1, min(MAX_ZOOM, zoom + event.y))
+                    if zoom != old_zoom:
+                        c_pixel_x = (mouse_x - camera_x) / old_zoom
+                        c_pixel_y = (mouse_y - camera_y) / old_zoom
+                        camera_x = int(mouse_x - (c_pixel_x * zoom))
+                        camera_y = int(mouse_y - (c_pixel_y * zoom))
+                        rebuild_scaled_surf()
+                elif mods & pygame.KMOD_SHIFT:
+                    camera_x += event.y * 35
+                else:
+                    camera_y += event.y * 35
+                clamp_camera()
+
+    # Continuous drawing / erasing
+    if (pressed[0] and not is_pasting and not is_moving and
+            not dragging_v_scroll and not dragging_h_scroll):
+        if mouse_x < canvas_view_width:
+            if 0 <= canvas_pixel_x < WIDTH and 0 <= canvas_pixel_y < HEIGHT:
+                if current_tool == "draw":
+                    set_pixel(canvas_pixel_x, canvas_pixel_y, current_color_index)
+                elif current_tool == "eraser":
+                    set_pixel(canvas_pixel_x, canvas_pixel_y, 0)
+
+    try:
+        root.update()
+    except tk.TclError:
+        pass
+
+    # ---------- Rendering ----------
+    screen.fill((25, 25, 25))
+
+    # Hybrid canvas
+    if zoom <= SCALED_THRESHOLD:
+        if scaled_surf is None or last_zoom != zoom:
+            rebuild_scaled_surf()
+        if scaled_surf:
+            screen.blit(scaled_surf, (camera_x, camera_y))
+    else:
+        left   = max(0, (-camera_x) // zoom)
+        top    = max(0, (-camera_y) // zoom)
+        right  = min(WIDTH,  (canvas_view_width - camera_x) // zoom + 2)
+        bottom = min(HEIGHT, (w_height - camera_y) // zoom + 2)
+        for y in range(top, bottom):
+            for x in range(left, right):
+                color = canvas_surf.get_at((x, y))
+                screen.fill(color, (camera_x + x * zoom, camera_y + y * zoom, zoom, zoom))
+
+    # Paste preview
+    if is_pasting and clipboard:
+        pw, ph = clipboard['w'], clipboard['h']
+        pdata = clipboard['data']
+        for py in range(ph):
+            for px in range(pw):
+                tx = paste_x + px
+                ty = paste_y + py
+                if 0 <= tx < WIDTH and 0 <= ty < HEIGHT:
+                    color = palette_rgb[pdata[py * pw + px]]
+                    screen.fill(color, (camera_x + tx * zoom, camera_y + ty * zoom, zoom, zoom))
+
+    # Move preview + size label
+    if is_moving and move_buffer:
+        pw, ph = move_buffer['w'], move_buffer['h']
+        pdata = move_buffer['data']
+        for py in range(ph):
+            for px in range(pw):
+                tx = move_x + px
+                ty = move_y + py
+                if 0 <= tx < WIDTH and 0 <= ty < HEIGHT:
+                    color = palette_rgb[pdata[py * pw + px]]
+                    screen.fill(color, (camera_x + tx * zoom, camera_y + ty * zoom, zoom, zoom))
+        pygame.draw.rect(screen, (255, 180, 0),
+                         (camera_x + move_x * zoom, camera_y + move_y * zoom,
+                          pw * zoom, ph * zoom), 2)
+        draw_size_label(camera_x + move_x * zoom,
+                        camera_y + move_y * zoom,
+                        pw, ph, color=(255, 180, 0))
+
+    # Selection outline + size label
+    if selection_box and not is_pasting and not is_moving:
+        sx, sy, sw, sh = selection_box
+        pygame.draw.rect(screen, (0, 255, 255),
+                         (camera_x + sx * zoom, camera_y + sy * zoom, sw * zoom, sh * zoom), 2)
+        draw_size_label(camera_x + sx * zoom,
+                        camera_y + sy * zoom,
+                        sw, sh, color=(0, 255, 255))
+
+    # Pixel cursor
+    if mouse_x < canvas_view_width and not is_pasting and not is_moving:
+        if 0 <= canvas_pixel_x < WIDTH and 0 <= canvas_pixel_y < HEIGHT:
+            cur_rect = pygame.Rect(camera_x + canvas_pixel_x * zoom,
+                                   camera_y + canvas_pixel_y * zoom, zoom, zoom)
+            if current_tool == "eraser":
+                cursor_color = (255, 0, 255)
+            elif current_tool == "draw":
+                cursor_color = (255, 255, 0)
+            elif current_tool == "bucket":
+                cursor_color = (0, 150, 255)
+            else:
+                cursor_color = (0, 255, 255)
+            pygame.draw.rect(screen, cursor_color, cur_rect, 1)
+
+    # Scrollbars
+    sb_size = 14
+    v_track = pygame.Rect(canvas_view_width - sb_size, 0, sb_size, w_height - sb_size)
+    pygame.draw.rect(screen, (35, 35, 35), v_track)
+    total_h = HEIGHT * zoom
+    if total_h > w_height:
+        track_h = w_height - sb_size
+        fraction = w_height / total_h
+        thumb_h = max(20, int(track_h * fraction))
+        progress = max(0.0, min(1.0, (-camera_y) / (total_h - w_height)))
+        thumb_y = int(progress * (track_h - thumb_h))
+        pygame.draw.rect(screen, (100, 100, 100),
+                         (canvas_view_width - sb_size + 2, thumb_y + 2, sb_size - 4, thumb_h - 4),
+                         border_radius=3)
+
+    h_track = pygame.Rect(0, w_height - sb_size, canvas_view_width - sb_size, sb_size)
+    pygame.draw.rect(screen, (35, 35, 35), h_track)
+    total_w = WIDTH * zoom
+    if total_w > canvas_view_width:
+        track_w = canvas_view_width - sb_size
+        fraction = canvas_view_width / total_w
+        thumb_w = max(20, int(track_w * fraction))
+        progress = max(0.0, min(1.0, (-camera_x) / (total_w - canvas_view_width)))
+        thumb_x = int(progress * (track_w - thumb_w))
+        pygame.draw.rect(screen, (100, 100, 100),
+                         (thumb_x + 2, w_height - sb_size + 2, thumb_w - 4, sb_size - 4),
+                         border_radius=3)
+
+    pygame.draw.rect(screen, (30, 30, 30),
+                     (canvas_view_width - sb_size, w_height - sb_size, sb_size, sb_size))
+
+    # UI Sidebar
+    ui_start_x = canvas_view_width
+    pygame.draw.rect(screen, (40, 40, 40), (ui_start_x, 0, UI_WIDTH, w_height))
+    pygame.draw.line(screen, (80, 80, 80), (ui_start_x, 0), (ui_start_x, w_height), 2)
+
+    short_filename = current_filename.split("/")[-1].split("\\")[-1]
+    texts = [
+        f"File: {short_filename}",
+        f"Tool: {current_tool.upper()} (Press T)",
+        f"Color: {current_color_index} (0x{current_color_index:02X})",
+        f"Zoom: {zoom}x  (max {MAX_ZOOM}x)",
+        "-" * 38,
+        "Controls:",
+        "Wheel: Scroll | Shift+Wheel: Horizontal",
+        "Ctrl+Wheel: Zoom toward mouse",
+        "T: Cycle Draw / Select / Eraser / Bucket",
+        "Ctrl+C/X/V: Copy / Cut / Paste",
+        "Ctrl+Alt + Drag: Move selection",
+        "R-Click + Drag: Pan"
+    ]
+    for i, text in enumerate(texts):
+        color = (255, 255, 255) if i < 4 else (200, 200, 200)
+        screen.blit(font.render(text, True, color), (ui_start_x + 15, 12 + i * 17))
+
+    # Colour swatches
+    swatch_x = ui_start_x + 15
+    swatch_y = 230
+    cell = 18
+    for r in range(16):
+        for c in range(16):
+            idx = r * 16 + c
+            if idx < 256:
+                pygame.draw.rect(screen, palette_rgb[idx],
+                                 (swatch_x + c * cell, swatch_y + r * cell, 16, 16))
+                if idx == current_color_index:
+                    pygame.draw.rect(screen, (255, 255, 255),
+                                     (swatch_x + c * cell - 1, swatch_y + r * cell - 1, 18, 18), 2)
+
+    # Buttons
+    btn_y = w_height - 110
+    buttons = [
+        ("OPEN FILE (O)", (70, 130, 70)),
+        ("SAVE (S)", (70, 70, 140)),
+        ("SAVE AS... (Ctrl+S)", (140, 70, 70))
+    ]
+    for i, (label, col) in enumerate(buttons):
+        rect = pygame.Rect(ui_start_x + 15, btn_y + i * 35, UI_WIDTH - 30, 30)
+        pygame.draw.rect(screen, col, rect, border_radius=4)
+        pygame.draw.rect(screen, (200, 200, 200), rect, 1, border_radius=4)
+        txt = font.render(label, True, (255, 255, 255))
+        screen.blit(txt, txt.get_rect(center=rect.center))
+
+    pygame.display.flip()
+    clock.tick(60)
+
+pygame.quit()
+sys.exit()
