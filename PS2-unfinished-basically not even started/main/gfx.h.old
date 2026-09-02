@@ -1,0 +1,15 @@
+#ifndef GFX_H
+#define GFX_H
+
+void gfx_init(void);
+
+void gfx_clear(u64 color);
+void gfx_flip(void);
+void gfx_exec(void);
+void gfx_reset(void);
+
+int gfx_load_level(const char *path, int startx, int starty);
+void gfx_level_update(void);
+void gfx_draw_level(void);
+
+#endif

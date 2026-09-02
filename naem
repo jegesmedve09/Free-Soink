@@ -1,0 +1,89 @@
+import random
+
+list_a = [
+"Tropical",
+"Dusty",
+"Ancient",
+"Frozen",
+"Fractured",
+"Speed",
+"Final",
+"Lost",
+"Thunder",
+"Seaside",
+"Dark",
+"Ocean",
+"Sky",
+"Emerald",
+"Sweet",
+"Space",
+"Chaos",
+"Leaf",
+"Grand",
+"Crisis",
+"Sunset",
+"Neo",
+"Flame",
+"Mystic",
+"Sandy",
+"Silent",
+"Cursed",
+"Forgotten"
+]
+
+list_b = [
+"City",
+"Hill",
+"Valley",
+"Isle",
+"Canyon",
+"Highway",
+"Rush",
+"Fortress",
+"Ruins",
+"Mountain",
+"Coast",
+"Egg",
+"Park",
+"Core",
+"Base",
+"Fleet",
+"Castle",
+"Casino",
+"Nature",
+"Street",
+"Scamper",
+"Mirage",
+"Palace",
+"Hollow",
+"Summit",
+"Terminal"
+]
+
+af = []
+
+print("Generating list...")
+for i in range(1024):
+    word1 = random.choice(list_a)
+    word2 = random.choice(list_b)
+
+    chunk = f"{word1} {word2}"
+    ##print(chunk)
+    af.append(chunk)
+
+print("Stripping...")
+for i in range(5):
+    for j in range(len(af)):
+        an = random.randint(0,1)
+        if an == 1:
+            af[j] = ""
+    af = list(set(af))
+
+print("Writing...")
+f = open("name.txt", "w")
+
+for i in range(len(af)):
+    f.write(f"{af[i]}\n")
+
+f.close();
+print("TERM")

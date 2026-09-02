@@ -1,0 +1,107 @@
+import turtle
+
+# Paste your raw text block inside this triple-quoted string
+RAW_PALETTE_DATA = """
+000 020 040 060 080 0A0 0C0 0E0 
+002 022 042 062 082 0A2 0C2 0E2 
+004 024 044 064 084 0A4 0C4 0E4 
+006 026 046 066 086 0A6 0C6 0E6 
+008 028 048 068 088 0A8 0C8 0E8 
+00A 02A 04A 06A 08A 0AA 0CA 0EA 
+00C 02C 04C 06C 08C 0AC 0CC 0EC 
+00E 02E 04E 06E 08E 0AE 0CE 0EE 
+
+400 420 440 460 480 4A0 4C0 4E0 
+402 422 442 462 482 4A2 4C2 4E2 
+404 424 444 464 484 4A4 4C4 4E4 
+406 426 446 466 486 4A6 4C6 4E6 
+408 428 448 468 488 4A8 4C8 4E8 
+40A 42A 44A 46A 48A 4AA 4CA 4EA 
+40C 42C 44C 46C 48C 4AC 4CC 4EC 
+40E 42E 44E 46E 48E 4AE 4CE 4EE 
+
+800 820 840 860 880 8A0 8C0 8E0 
+802 822 842 862 882 8A2 8C2 8E2 
+804 824 844 864 884 8A4 8C4 8E4 
+806 826 846 866 886 8A6 8C6 8E6 
+808 828 848 868 888 8A8 8C8 8E8 
+80A 82A 84A 86A 88A 8AA 8CA 8EA 
+80C 82C 84C 86C 88C 8AC 8CC 8EC 
+80E 82E 84E 86E 88E 8AE 8CE 8EE 
+
+C00 C20 C40 C60 C80 CA0 CC0 CE0 
+C02 C22 C42 C62 C82 CA2 CC2 CE2 
+C04 C24 C44 C64 C84 CA4 CC4 CE4 
+C06 C26 C46 C66 C86 CA6 CC6 CE6 
+C08 C28 C48 C68 C88 CA8 CC8 CE8 
+C0A C2A C4A C6A C8A CAA CCA CEA 
+C0C C2C C4C C6C C8C CAC CCC CEC 
+C0E C2E C4E C6E C8E CAE CCE CEE 
+"""
+
+# Hardware accurate 3-bit VDP to 8-bit standard RGB hex mapping
+vdp_to_rgb8 = {
+    '0': '00', '2': '20', '4': '40', '6': '60',
+    '8': '80', 'A': 'A0', 'C': 'C0', 'E': 'E0'
+}
+
+def parse_and_convert(token):
+    """Correctly slices tokens into separate R, G, and B components"""
+    token = token.upper()
+    r = vdp_to_rgb8[token[0]] # Red is 1st digit
+    g = vdp_to_rgb8[token[1]] # Green is 2nd digit
+    b = vdp_to_rgb8[token[2]] # Blue is 3rd digit
+    return f"#{r}{g}{b}"
+
+# Setup Turtle canvas settings
+screen = turtle.Screen()
+screen.title("Fixed Sega Genesis Color Plotter")
+screen.bgcolor("#151515")
+screen.setup(width=600, height=950)
+
+t = turtle.Turtle()
+t.speed(0)
+t.hideturtle()
+turtle.tracer(0, 0) 
+
+# Layout constraints
+tile_size = 22
+padding = 2
+line_height = tile_size + padding
+start_x = -((8 * (tile_size + padding)) / 2)
+current_y = 440
+
+# Process the string line by line
+lines = RAW_PALETTE_DATA.strip().split('\n')
+
+for line in lines:
+    tokens = line.strip().split()
+    
+    if not tokens:
+        current_y -= 15 # Empty line spacing gap
+        continue
+        
+    current_x = start_x
+    for token in tokens:
+        if len(token) == 3:
+            hex_color = parse_and_convert(token)
+            
+            t.penup()
+            t.goto(current_x, current_y)
+            t.pendown()
+            
+            t.color(hex_color)
+            t.begin_fill()
+            for _ in range(4):
+                t.forward(tile_size)
+                t.right(90)
+            t.end_fill()
+            
+            current_x += tile_size + padding
+            
+    current_y -= line_height
+
+turtle.update()
+print("Finished rendering color grid properly!")
+turtle.done()
+

@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+
+default_path=$(pwd)
+echo "Default Path: $default_path"
+
+if [ "$1" = "help" ]; then
+    echo "use $0 clean to clean only"
+    echo "use $0 to clean and build"
+    exit 0
+fi
+
+echo "Cleaning up..."
+
+if [ -d "main" ]; then
+    echo "Cleaning MAIN..."
+    (cd main && make clean) || echo "MAIN clean skipped/failed"
+fi
+
+echo "Cleaning BUILD..."
+if [ -d "BUILD" ]; then
+    rm -rf BUILD/*
+    echo "Cleaning BUILD OK"
+else
+    mkdir -p BUILD
+fi
+
+if [ "$1" = "clean" ]; then
+    echo "Cleaning complete."
+    exit 0
+fi
+
+echo "Compiling MAIN..."
+if [ -d "main" ]; then
+    if ! (cd main && make); then
+        echo "Error: MAIN compilation failed!"
+        exit 1
+    fi
+    echo "Compiling MAIN OK"
+else
+    echo "Error: main directory missing!"
+    exit 1
+fi
+
+echo "Generating Build..."
+mkdir -p BUILD
+
+if [ -d "./main/build" ]; then
+    cp -r ./main/build/* ./BUILD/
+fi
+
+if [ -d "ASSETS" ]; then
+    for dir in BUILD/*/; do
+        if [ -d "$dir" ]; then
+            cp -r ASSETS/* "$dir"
+        fi
+    done
+fi
+
+echo "Generating Build OK"
+
+/BUILD/linux/STHCW
+

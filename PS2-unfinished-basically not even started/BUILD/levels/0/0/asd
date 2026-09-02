@@ -1,0 +1,69 @@
+#include <gsKit.h>
+#include <gsToolkit.h>
+
+// 1. Hard-coded Swizzled Palette (256 entries, RGBA8888)
+// Make sure this array has been passed through the swizzling script provided earlier!
+// Set the last byte (Alpha) to 0xFF for fully opaque levels.
+const uint32_t my_level_palette[256] = {
+    0x000000FF, 0x200000FF, // ... add all 256 here ...
+    // ...
+};
+
+// 2. Load the Palette and Texture
+void load_level_resources(GSGLOBAL *gsGlobal, GSIMAGE *level_image, void *raw_pixel_data) {
+    
+    // Allocate VRAM for the texture and the CLUT
+    level_image->Vram = gsKit_vram_alloc(gsGlobal, level_image->Width * level_image->Height * 1, GSKIT_ALLOC_USERBUFFER);
+    level_image->Clut = gsKit_vram_alloc(gsGlobal, 256 * 4, GSKIT_ALLOC_USERBUFFER); // 256 entries * 4 bytes
+
+    // Configure the CLUT specific settings
+    level_image->ClutPSM = GS_PSM_32;       // The CLUT itself must be RGBA32
+    level_image->ClutStorageMode = GS_CLUT_CSM1; // Crucial for swizzled CLUTs
+    level_image->ClutPtr = (void*)my_level_palette; // Point to your array
+
+    // Upload to VRAM
+    // gsKit will take the 'ClutPtr' (your array) and upload it to the VRAM address
+    // specified in 'Clut'. Since your array is already swizzled, this works perfectly.
+    gsKit_texture_upload(gsGlobal, level_image);
+}
+
+
+
+
+
+000 020 040 060 080 0A0 0C0 0E0 
+002 022 042 062 082 0A2 0C2 0E2 
+004 024 044 064 084 0A4 0C4 0E4 
+006 026 046 066 086 0A6 0C6 0E6 
+008 028 048 068 088 0A8 0C8 0E8 
+00A 02A 04A 06A 08A 0AA 0CA 0EA 
+00C 02C 04C 06C 08C 0AC 0CC 0EC 
+00E 02E 04E 06E 08E 0AE 0CE 0EE 
+
+400 420 440 460 480 4A0 4C0 4E0 
+402 422 442 462 482 4A2 4C2 4E2 
+404 424 444 464 484 4A4 4C4 4E4 
+406 426 446 466 486 4A6 4C6 4E6 
+408 428 448 468 488 4A8 4C8 4E8 
+40A 42A 44A 46A 48A 4AA 4CA 4EA 
+40C 42C 44C 46C 48C 4AC 4CC 4EC 
+40E 42E 44E 46E 48E 4AE 4CE 4EE 
+
+800 820 840 860 880 8A0 8C0 8E0 
+802 822 842 862 882 8A2 8C2 8E2 
+804 824 844 864 884 8A4 8C4 8E4 
+806 826 846 866 886 8A6 8C6 8E6 
+808 828 848 868 888 8A8 8C8 8E8 
+80A 82A 84A 86A 88A 8AA 8CA 8EA 
+80C 82C 84C 86C 88C 8AC 8CC 8EC 
+80E 82E 84E 86E 88E 8AE 8CE 8EE 
+
+C00 C20 C40 C60 C80 CA0 CC0 CE0 
+C02 C22 C42 C62 C82 CA2 CC2 CE2 
+C04 C24 C44 C64 C84 CA4 CC4 CE4 
+C06 C26 C46 C66 C86 CA6 CC6 CE6 
+C08 C28 C48 C68 C88 CA8 CC8 CE8 
+C0A C2A C4A C6A C8A CAA CCA CEA 
+C0C C2C C4C C6C C8C CAC CCC CEC 
+C0E C2E C4E C6E C8E CAE CCE CEE 
+

@@ -1,0 +1,13 @@
+#ifndef GFX_H
+#define GFX_H
+
+void gfx_init(void);
+
+void gfx_clear(u64 color);
+void gfx_flip(void);
+void gfx_exec(void);
+void gfx_reset(void);
+
+void load_and_test_block_0_0(void);
+void draw_block_0_0(void);
+#endif
