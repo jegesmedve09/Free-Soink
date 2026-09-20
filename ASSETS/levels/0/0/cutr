@@ -1,0 +1,927 @@
+#!/usr/bin/env python3
+"""
+cutr - cut 320x224 boxes out of any image and save them as .xpg tiles.
+
+Open a big image (png, jpg, bmp, gif, tga, webp ...), drop as many 320x224 boxes
+on it as you like, give every box its own "X,Y" number, then EXPORT: every box
+is quantised to the 256-colour palette and written as "X,Y.xpg" into a folder.
+
+The number of a box has nothing to do with where it sits on the source image:
+a box sitting at pixel (1234, 567) can be called 5,6 if you want.
+
+Boxes may hang off the edge of the image (up to one whole box outside, so a box can
+even sit completely outside). Whatever part of a box is outside the image is written
+as 0x00 (000), exactly like transparent pixels.
+
+000 (index 0) means "transparent" in the hardware, so real black in the picture can't stay
+000: any opaque pixel that would become 000 is written as 002 (index 8) instead, see
+BLACK_REPLACEMENT. Transparent pixels and everything off the image are 000 / 0x00.
+
+Controls
+  O            open image                A            add a box (at the mouse, or view centre)
+  click box    select / drag it          Del          delete selected box
+  Enter        edit label of selection   Tab          next box (Shift+Tab: previous)
+  arrows       nudge 1px (Shift = 8px, Ctrl = one whole box)
+  G            snap boxes to the 320x224 grid (also shows the grid)
+  F            fit image to window       E            export all boxes
+  Ctrl+S       save boxes + labels to <image>.xpconfig   (Shift+Ctrl+S: save as...)
+  L            load boxes from an .xpconfig file (open the image first)
+  Wheel / Shift+Wheel   scroll            Ctrl+Wheel   zoom at mouse
+  middle or right mouse drag            pan
+
+Usage:  python3 cutr.py [image]
+"""
+import math
+import os
+import re
+import sys
+from collections import Counter
+
+import pygame
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+except ImportError:  # dialogs are optional, an image path can be given on the command line
+    tk = None
+
+# ------------------------------------------------------------------ config
+BOX_W, BOX_H = 320, 224
+EXT = ".xpg"
+CONFIG_EXT = ".xpconfig"     # plain-text box list, written by Ctrl+S
+UI_WIDTH = 340
+MIN_ZOOM, MAX_ZOOM = 0.02, 32.0
+ROW_H, LIST_ROWS = 18, 7
+ALPHA_CUTOFF = 128          # alpha below this -> palette index 0 (transparent)
+BLACK_REPLACEMENT = 8       # 000 (index 0) is transparency in the hardware, so any OPAQUE pixel that would
+                            # come out as 000 is written as this index instead: 002 (index 8), the darkest
+                            # colour that is not 000 - black enough to fool ya. Set to 0 to switch this off.
+
+# ------------------------------------------------------------------ palette (same table as drawr / animator)
+raw_data = """
+000 020 040 060 080 0A0 0C0 0E0
+002 022 042 062 082 0A2 0C2 0E2
+004 024 044 064 084 0A4 0C4 0E4
+006 026 046 066 086 0A6 0C6 0E6
+008 028 048 068 088 0A8 0C8 0E8
+00A 02A 04A 06A 08A 0AA 0CA 0EA
+00C 02C 04C 06C 08C 0AC 0CC 0EC
+00E 02E 04E 06E 08E 0AE 0CE 0EE
+400 420 440 460 480 4A0 4C0 4E0
+402 422 442 462 482 4A2 4C2 4E2
+404 424 444 464 484 4A4 4C4 4E4
+406 426 446 466 486 4A6 4C6 4E6
+408 428 448 468 488 4A8 4C8 4E8
+40A 42A 44A 46A 48A 4AA 4CA 4EA
+40C 42C 44C 46C 48C 4AC 4CC 4EC
+40E 42E 44E 46E 48E 4AE 4CE 4EE
+800 820 840 860 880 8A0 8C0 8E0
+802 822 842 862 882 8A2 8C2 8E2
+804 824 844 864 884 8A4 8C4 8E4
+806 826 846 866 886 8A6 8C6 8E6
+808 828 848 868 888 8A8 8C8 8E8
+80A 82A 84A 86A 88A 8AA 8CA 8EA
+80C 82C 84C 86C 88C 8AC 8CC 8EC
+80E 82E 84E 86E 88E 8AE 8CE 8EE
+C00 C20 C40 C60 C80 CA0 CC0 CE0
+C02 C22 C42 C62 C82 CA2 CC2 CE2
+C04 C24 C44 C64 C84 CA4 CC4 CE4
+C06 C26 C46 C66 C86 CA6 CC6 CE6
+C08 C28 C48 C68 C88 CA8 CC8 CE8
+C0A C2A C4A C6A C8A CAA CCA CEA
+C0C C2C C4C C6C C8C CAC CCC CEC
+C0E C2E C4E C6E C8E CAE CCE CEE
+"""
+palette_rgb = []
+for token in raw_data.split():
+    palette_rgb.append((int(token[0], 16) << 4, int(token[1], 16) << 4, int(token[2], 16) << 4))
+while len(palette_rgb) < 256:
+    palette_rgb.append((0, 0, 0))
+PAL_BYTES = [bytes(c) for c in palette_rgb]
+assert palette_rgb[BLACK_REPLACEMENT] == (0, 0, 32) or BLACK_REPLACEMENT == 0, \
+    "BLACK_REPLACEMENT no longer points at 002 - check the palette table"
+# the preview shows index 0 (transparent / outside the image) as a grey checkerboard
+CHECK_PIX = [bytes((58, 58, 58)) if ((i % BOX_W) // 8 + (i // BOX_W) // 8) % 2 == 0 else bytes((88, 88, 88))
+             for i in range(BOX_W * BOX_H)]
+
+
+# ------------------------------------------------------------------ colour quantiser
+# The palette above is a regular grid: index = r_step*64 + b_step*8 + g_step, so the nearest
+# colour can be found one channel at a time (exactly the same answer as brute force, but ~1000x
+# faster). If you ever change the palette so it is no longer that grid, the check below notices
+# and we fall back to a (slower, cached) brute-force search.
+R_LEVELS = [0, 64, 128, 192]
+G_LEVELS = B_LEVELS = [0, 32, 64, 96, 128, 160, 192, 224]
+
+
+def _palette_is_grid():
+    return all(palette_rgb[i] == (R_LEVELS[i >> 6], G_LEVELS[i & 7], B_LEVELS[(i >> 3) & 7])
+               for i in range(256))
+
+
+def _nearest_level(levels, v):
+    return min(range(len(levels)), key=lambda i: abs(levels[i] - v))
+
+
+FAST_QUANT = _palette_is_grid()
+if FAST_QUANT:
+    _RT = bytes(_nearest_level(R_LEVELS, v) * 64 for v in range(256))
+    _GT = bytes(_nearest_level(G_LEVELS, v) for v in range(256))
+    _BT = bytes(_nearest_level(B_LEVELS, v) * 8 for v in range(256))
+_slow_cache = {}
+
+
+def quantize_rgba(raw):
+    """RGBA bytes -> bytes of palette indices.
+
+    alpha < ALPHA_CUTOFF        -> 0 (transparent)
+    opaque, nearest is 000      -> BLACK_REPLACEMENT = 002 (000 is reserved for transparency)
+    otherwise                   -> nearest palette colour
+    """
+    if FAST_QUANT:
+        rs = raw[0::4].translate(_RT)
+        gs = raw[1::4].translate(_GT)
+        bs = raw[2::4].translate(_BT)
+        al = raw[3::4]
+        return bytes(0 if a < ALPHA_CUTOFF else ((r + g + b) or BLACK_REPLACEMENT)
+                     for r, g, b, a in zip(rs, gs, bs, al))
+    out = bytearray(len(raw) // 4)
+    for i in range(len(out)):
+        r, g, b, a = raw[4 * i:4 * i + 4]
+        if a < ALPHA_CUTOFF:
+            continue
+        idx = _slow_cache.get((r, g, b))
+        if idx is None:
+            idx = min(range(256), key=lambda k: (r - palette_rgb[k][0]) ** 2 +
+                      (g - palette_rgb[k][1]) ** 2 + (b - palette_rgb[k][2]) ** 2)
+            idx = idx or BLACK_REPLACEMENT
+            _slow_cache[(r, g, b)] = idx
+        out[i] = idx
+    return bytes(out)
+
+
+_tobytes = getattr(pygame.image, "tobytes", None) or pygame.image.tostring
+
+
+def crop_indices(img, x, y):
+    """The BOX_W x BOX_H area at (x, y) as palette indices.
+
+    (x, y) may be negative or run past the image: every byte that is not covered by the
+    image stays exactly 0x00 (the buffer starts out all zeros and only the overlap is filled in).
+    """
+    iw, ih = img.get_size()
+    out = bytearray(BOX_W * BOX_H)                     # 0x00 everywhere
+    x0, y0 = max(x, 0), max(y, 0)                      # overlap of box and image, in image coordinates
+    x1, y1 = min(x + BOX_W, iw), min(y + BOX_H, ih)
+    w, h = x1 - x0, y1 - y0
+    if w <= 0 or h <= 0:
+        return bytes(out)                              # box completely outside -> all 0x00
+    idx = quantize_rgba(_tobytes(img.subsurface((x0, y0, w, h)), "RGBA"))
+    ox, oy = x0 - x, y0 - y                            # where the overlap lands inside the tile
+    for row in range(h):
+        start = (oy + row) * BOX_W + ox
+        out[start:start + w] = idx[row * w:(row + 1) * w]
+    return bytes(out)
+
+
+def encode_xpg(indices):
+    """Bytes that end up in the .xpg file.
+
+    Currently: raw, headerless, 8bpp, row-major, 320*224 = 71680 bytes of palette indices
+    (identical layout to the .lvl files drawr/animator use). If .xpg needs a header, swizzling,
+    compression ... this is the one place to change.
+    """
+    return indices
+
+
+def snap_val(v, step):
+    return int(math.floor(v / step + 0.5)) * step
+
+
+def parse_config(text):
+    """Text of an .xpconfig -> (meta dict, list of box dicts). Raises ValueError on a bad box line.
+
+    Format (one thing per line, '#' at the start of a line = comment):
+        XPCONFIG 1
+        image = big.png
+        image_size = 1000x700
+        box_size = 320x224
+        box = 0,1 @ 500,0        <- label X,Y  @  pixel position on the source image
+    """
+    meta, boxes = {}, []
+    for n, line in enumerate(text.splitlines(), 1):
+        line = line.strip().lstrip("\ufeff")
+        if not line or line.startswith("#") or line.upper().startswith("XPCONFIG"):
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip().lower(), val.strip()
+        if key == "box":
+            m = re.fullmatch(r"(\d+)\s*,\s*(\d+)\s*@\s*(-?\d+)\s*,\s*(-?\d+)", val)
+            if not m:
+                raise ValueError(f"line {n}: can't read box '{val}' (expected: box = 3,7 @ 640,448)")
+            gx, gy, x, y = map(int, m.groups())
+            boxes.append({"gx": gx, "gy": gy, "x": x, "y": y})
+        elif key in ("image", "image_size", "box_size"):
+            meta[key] = val
+    return meta, boxes
+
+
+# ------------------------------------------------------------------ app
+class App:
+    def __init__(self, path=None):
+        pygame.init()
+        self.root = None
+        if tk:
+            try:
+                self.root = tk.Tk()
+                self.root.withdraw()
+                self.root.update()
+            except tk.TclError:
+                self.root = None
+        self.screen = pygame.display.set_mode((1280, 760), pygame.RESIZABLE)
+        pygame.display.set_caption("cutr - image -> 320x224 .xpg tiles")
+        self.clock = pygame.time.Clock()
+        self.font = pygame.font.SysFont(None, 20)
+        self.font_small = pygame.font.SysFont(None, 18)
+        self.font_bold = pygame.font.SysFont(None, 22, bold=True)
+
+        self.img = None
+        self.img_name = "(none)"
+        self.img_path = None
+        self.config_path = None  # where Ctrl+S writes (set by a save or a load)
+        self.boxes = []          # dicts: x, y (pixels on the source image), gx, gy (the X,Y label)
+        self.sel = -1
+        self.zoom = 1.0
+        self.cam_x = 20.0        # screen position of the image's top-left corner
+        self.cam_y = 20.0
+        self.snap = False
+        self.drag = None         # grab offset while dragging a box
+        self.panning = False
+        self.editing = False
+        self.edit_str = ""
+        self.list_scroll = 0
+        self.preview = None
+        self.preview_key = None
+        self.status = ""
+        self.status_until = 0
+        self.last_dir = os.getcwd()
+        self.running = True
+        if path:
+            self.load_image(path)
+
+    # ---------------------------------------------------------- small helpers
+    def say(self, msg, ms=5000):
+        print(msg)
+        self.status = msg
+        self.status_until = pygame.time.get_ticks() + ms
+
+    def view_size(self):
+        w, h = self.screen.get_size()
+        return w - UI_WIDTH, h
+
+    def to_img(self, sx, sy):
+        return (sx - self.cam_x) / self.zoom, (sy - self.cam_y) / self.zoom
+
+    def layout(self):
+        w, h = self.screen.get_size()
+        ux = w - UI_WIDTH
+        return {
+            "ux": ux,
+            "label": pygame.Rect(ux + 15, 132, UI_WIDTH - 30, 28),
+            "list": pygame.Rect(ux + 15, 200, UI_WIDTH - 30, ROW_H * LIST_ROWS),
+            "preview": pygame.Rect(ux + 10, 350, BOX_W, BOX_H),
+            "buttons": [pygame.Rect(ux + 15 + (i % 2) * ((UI_WIDTH - 35) // 2 + 5), h - 115 + (i // 2) * 35,
+                                    (UI_WIDTH - 35) // 2, 30) for i in range(6)],
+        }
+
+    def duplicates(self):
+        c = Counter((b["gx"], b["gy"]) for b in self.boxes)
+        return {k for k, v in c.items() if v > 1}
+
+    # ---------------------------------------------------------- image / camera
+    def fit_view(self):
+        if not self.img:
+            return
+        vw, vh = self.view_size()
+        iw, ih = self.img.get_size()
+        self.zoom = max(MIN_ZOOM, min(4.0, vw / iw * 0.95, vh / ih * 0.95))
+        self.cam_x = (vw - iw * self.zoom) / 2
+        self.cam_y = (vh - ih * self.zoom) / 2
+
+    def clamp_camera(self):
+        if not self.img:
+            return
+        vw, vh = self.view_size()
+        iw, ih = self.img.get_size()
+        self.cam_x = max(-iw * self.zoom + 50, min(vw - 50, self.cam_x))
+        self.cam_y = max(-ih * self.zoom + 50, min(vh - 50, self.cam_y))
+
+    def load_image(self, path, offer=True):
+        try:
+            surf = pygame.image.load(path).convert_alpha()
+        except Exception as e:  # pygame.error, FileNotFoundError, ...
+            self.say(f"Could not open image: {e}")
+            return
+        self.img = surf
+        self.img_path = os.path.abspath(path)
+        self.img_name = os.path.basename(path)
+        self.last_dir = os.path.dirname(self.img_path)
+        self.config_path = None
+        self.boxes = []
+        self.sel = -1
+        self.list_scroll = 0
+        self.preview = None
+        self.preview_key = None
+        self.fit_view()
+        self.say(f"Loaded {self.img_name}  ({surf.get_width()}x{surf.get_height()})")
+        if offer:
+            cfg = self.find_config()
+            if cfg and self.root and messagebox.askyesno(
+                    "Load boxes?", f"Found {os.path.basename(cfg)} next to this image.\nLoad its boxes and continue?",
+                    master=self.root):
+                self.load_config(cfg)
+
+    def open_image(self):
+        if not self.root:
+            self.say("No tkinter here - pass the image on the command line: python3 cutr.py image.png")
+            return
+        if self.boxes and not messagebox.askyesno(
+                "Open image", "Opening another image removes the current boxes (Ctrl+S saves them first). Continue?", master=self.root):
+            return
+        path = filedialog.askopenfilename(
+            master=self.root, title="Open image", initialdir=self.last_dir,
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.gif *.tga *.webp *.tif *.tiff *.pcx"),
+                       ("All files", "*.*")])
+        if path:
+            self.load_image(path)
+
+    # ---------------------------------------------------------- boxes
+    def clamp_box(self, b):
+        # A box may hang off the image (that part is saved as 0x00). Limit: at most one whole
+        # box outside on any side, so it can never get lost far away from the image.
+        iw, ih = self.img.get_size()
+        b["x"] = max(-BOX_W, min(b["x"], iw))
+        b["y"] = max(-BOX_H, min(b["y"], ih))
+
+    def suggest_label(self, b):
+        used = {(o["gx"], o["gy"]) for o in self.boxes}
+        if self.snap:
+            cell = ((b["x"] + BOX_W // 2) // BOX_W, (b["y"] + BOX_H // 2) // BOX_H)
+            if cell not in used and min(cell) >= 0:
+                return cell
+        gy = self.boxes[-1]["gy"] if self.boxes else 0
+        gx = 0
+        while (gx, gy) in used:
+            gx += 1
+        return gx, gy
+
+    def add_box(self):
+        if not self.img:
+            self.say("Open an image first (O)")
+            return
+        vw, vh = self.view_size()
+        mx, my = pygame.mouse.get_pos()
+        if not (0 <= mx < vw and 0 <= my < vh):
+            mx, my = vw / 2, vh / 2
+        cx, cy = self.to_img(mx, my)
+        b = {"x": int(cx - BOX_W / 2), "y": int(cy - BOX_H / 2)}
+        if self.snap:
+            b["x"], b["y"] = snap_val(b["x"], BOX_W), snap_val(b["y"], BOX_H)
+        self.clamp_box(b)
+        b["gx"], b["gy"] = self.suggest_label(b)
+        self.boxes.append(b)
+        self.sel = len(self.boxes) - 1
+        self.ensure_visible()
+
+    def delete_box(self):
+        if 0 <= self.sel < len(self.boxes):
+            del self.boxes[self.sel]
+            self.sel = min(self.sel, len(self.boxes) - 1)
+            self.list_scroll = max(0, min(self.list_scroll, len(self.boxes) - LIST_ROWS))
+
+    def box_at(self, ix, iy):
+        order = list(range(len(self.boxes) - 1, -1, -1))
+        if self.sel >= 0:
+            order.remove(self.sel)
+            order.insert(0, self.sel)        # the selected box wins when boxes overlap
+        for i in order:
+            b = self.boxes[i]
+            if b["x"] <= ix < b["x"] + BOX_W and b["y"] <= iy < b["y"] + BOX_H:
+                return i
+        return -1
+
+    def ensure_visible(self):
+        if self.sel < self.list_scroll:
+            self.list_scroll = self.sel
+        elif self.sel >= self.list_scroll + LIST_ROWS:
+            self.list_scroll = self.sel - LIST_ROWS + 1
+        self.list_scroll = max(0, self.list_scroll)
+
+    def cycle(self, step):
+        if self.boxes:
+            self.sel = (self.sel + step) % len(self.boxes)
+            self.ensure_visible()
+
+    def nudge(self, dx, dy):
+        if not (self.img and 0 <= self.sel < len(self.boxes)):
+            return
+        mods = pygame.key.get_mods()
+        if mods & pygame.KMOD_CTRL:
+            sx, sy = BOX_W, BOX_H
+        elif mods & pygame.KMOD_SHIFT:
+            sx = sy = 8
+        else:
+            sx = sy = 1
+        b = self.boxes[self.sel]
+        b["x"] += dx * sx
+        b["y"] += dy * sy
+        self.clamp_box(b)
+
+    # ---------------------------------------------------------- label editing
+    def begin_edit(self):
+        if 0 <= self.sel < len(self.boxes):
+            b = self.boxes[self.sel]
+            self.editing = True
+            self.edit_str = f"{b['gx']},{b['gy']}"
+
+    def finish_edit(self, commit):
+        if not self.editing:
+            return
+        self.editing = False
+        if commit and 0 <= self.sel < len(self.boxes):
+            m = re.fullmatch(r"\s*(\d{1,4})\s*,\s*(\d{1,4})\s*", self.edit_str)
+            if m:
+                self.boxes[self.sel]["gx"] = int(m.group(1))
+                self.boxes[self.sel]["gy"] = int(m.group(2))
+            else:
+                self.say("Label must look like 3,7  (X,Y)")
+
+    def edit_key(self, e):
+        if e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self.finish_edit(True)
+        elif e.key == pygame.K_ESCAPE:
+            self.finish_edit(False)
+        elif e.key == pygame.K_BACKSPACE:
+            self.edit_str = self.edit_str[:-1]
+        elif e.unicode and e.unicode in "0123456789," and len(self.edit_str) < 12:
+            self.edit_str += e.unicode
+
+    # ---------------------------------------------------------- export
+    def export_all(self):
+        if not self.img or not self.boxes:
+            self.say("Nothing to export - open an image and add some boxes")
+            return
+        dups = self.duplicates()
+        if dups:
+            self.say("Duplicate labels (shown red): " + ", ".join(f"{x},{y}" for x, y in sorted(dups)))
+            return
+        if not self.root:
+            self.say("No tkinter here, so no folder dialog - can't export")
+            return
+        folder = filedialog.askdirectory(master=self.root, title="Export .xpg tiles into folder",
+                                         initialdir=self.last_dir)
+        if not folder:
+            return
+        names = [f"{b['gx']},{b['gy']}{EXT}" for b in self.boxes]
+        existing = [n for n in names if os.path.exists(os.path.join(folder, n))]
+        if existing and not messagebox.askyesno(
+                "Overwrite?", f"{len(existing)} file(s) already exist in that folder "
+                              f"(e.g. {existing[0]}). Overwrite them?", master=self.root):
+            return
+        try:
+            for b, name in zip(self.boxes, names):
+                with open(os.path.join(folder, name), "wb") as f:
+                    f.write(encode_xpg(crop_indices(self.img, b["x"], b["y"])))
+        except OSError as e:
+            self.say(f"Export failed: {e}")
+            return
+        self.last_dir = folder
+        self.say(f"Exported {len(names)} tile(s) to {folder}")
+
+    def export_to(self, folder):
+        """Same as export_all but without dialogs (used by the tests)."""
+        os.makedirs(folder, exist_ok=True)
+        for b in self.boxes:
+            with open(os.path.join(folder, f"{b['gx']},{b['gy']}{EXT}"), "wb") as f:
+                f.write(encode_xpg(crop_indices(self.img, b["x"], b["y"])))
+
+    # ---------------------------------------------------------- box config (.xpconfig)
+    def default_config_path(self):
+        return os.path.splitext(self.img_path)[0] + CONFIG_EXT
+
+    def find_config(self, image_path=None):
+        """An .xpconfig sitting next to the image with the same base name, if there is one."""
+        base = os.path.splitext(image_path or self.img_path)[0]
+        for ext in (CONFIG_EXT, CONFIG_EXT.upper()):
+            if os.path.isfile(base + ext):
+                return base + ext
+        return None
+
+    def config_text(self):
+        iw, ih = self.img.get_size()
+        lines = ["# cutr box config - plain text, safe to edit by hand",
+                 "# box = X,Y @ pixel_x,pixel_y   (the label, then where the box sits on the source image)",
+                 "XPCONFIG 1",
+                 f"image = {self.img_name}",
+                 f"image_size = {iw}x{ih}",
+                 f"box_size = {BOX_W}x{BOX_H}"]
+        lines += [f"box = {b['gx']},{b['gy']} @ {b['x']},{b['y']}" for b in self.boxes]
+        return "\n".join(lines) + "\n"
+
+    def save_config(self, save_as=False):
+        if not self.img:
+            self.say("Open an image first (O)")
+            return
+        if not self.boxes:
+            self.say("No boxes to save yet")
+            return
+        path = self.config_path or self.default_config_path()
+        if save_as:
+            if not self.root:
+                self.say("No tkinter here, so no save-as dialog")
+                return
+            path = filedialog.asksaveasfilename(
+                master=self.root, title="Save boxes as", initialdir=os.path.dirname(path),
+                initialfile=os.path.basename(path), defaultextension=CONFIG_EXT,
+                filetypes=[("cutr box config", "*.xpconfig *.XPCONFIG"), ("All files", "*.*")])
+            if not path:
+                return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.config_text())
+        except OSError as e:
+            self.say(f"Save failed: {e}  (try Shift+Ctrl+S to pick another place)")
+            return
+        self.config_path = path
+        self.say(f"Saved {len(self.boxes)} box(es) to {os.path.basename(path)}")
+
+    def load_config(self, path=None):
+        if path is None:
+            if self.root:
+                start = self.config_path or (self.find_config() if self.img_path else None)
+                path = filedialog.askopenfilename(
+                    master=self.root, title="Load boxes", initialdir=os.path.dirname(start) if start else self.last_dir,
+                    initialfile=os.path.basename(start) if start else "",
+                    filetypes=[("cutr box config", "*.xpconfig *.XPCONFIG"), ("All files", "*.*")])
+            elif self.img_path:
+                path = self.find_config()
+            if not path:
+                if not self.root:
+                    self.say("No .xpconfig next to the image (and no tkinter for a file dialog)")
+                return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                meta, new_boxes = parse_config(f.read())
+        except (OSError, ValueError) as e:
+            self.say(f"Could not load {os.path.basename(path)}: {e}")
+            return
+        if not self.img:  # no image open yet: try the one the config names, next to the config
+            named = meta.get("image")
+            cand = os.path.join(os.path.dirname(os.path.abspath(path)), named) if named else None
+            if cand and os.path.isfile(cand):
+                self.load_image(cand, offer=False)
+            if not self.img:
+                self.say("Open the image first (O), then load the boxes")
+                return
+        iw, ih = self.img.get_size()
+        note = ""
+        if meta.get("image_size") and meta["image_size"].lower() != f"{iw}x{ih}":
+            note = f" - careful: config was made for a {meta['image_size']} image, this one is {iw}x{ih}"
+        elif meta.get("image") and meta["image"] != self.img_name:
+            note = f" - note: config was made for {meta['image']}"
+        if self.boxes and self.root and not messagebox.askyesno(
+                "Load boxes", f"Replace the {len(self.boxes)} box(es) you have now with the {len(new_boxes)} from "
+                              f"{os.path.basename(path)}?{note}", master=self.root):
+            return
+        moved = 0
+        for b in new_boxes:
+            before = (b["x"], b["y"])
+            self.clamp_box(b)
+            moved += (b["x"], b["y"]) != before
+        self.boxes = new_boxes
+        self.sel = 0 if new_boxes else -1
+        self.list_scroll = 0
+        self.config_path = path
+        msg = f"Loaded {len(new_boxes)} box(es) from {os.path.basename(path)}"
+        if moved:
+            msg += f" ({moved} pulled back next to the image - too far outside)"
+        self.say(msg + note, 8000)
+
+    # ---------------------------------------------------------- events
+    def handle_event(self, e):
+        vw, vh = self.view_size()
+        if e.type == pygame.QUIT:
+            self.running = False
+
+        elif e.type == pygame.VIDEORESIZE:
+            self.screen = pygame.display.set_mode((max(e.w, UI_WIDTH + 400), max(e.h, 720)), pygame.RESIZABLE)
+            self.clamp_camera()
+
+        elif e.type == pygame.KEYDOWN:
+            mods = pygame.key.get_mods()
+            if e.key == pygame.K_s and mods & pygame.KMOD_CTRL:
+                self.finish_edit(True)          # don't lose a label that is still being typed
+                self.save_config(save_as=bool(mods & pygame.KMOD_SHIFT))
+                return
+            if self.editing:
+                self.edit_key(e)
+                return
+            k = e.key
+            if k == pygame.K_o:
+                self.open_image()
+            elif k == pygame.K_a:
+                self.add_box()
+            elif k == pygame.K_DELETE:
+                self.delete_box()
+            elif k == pygame.K_e:
+                self.export_all()
+            elif k == pygame.K_l:
+                self.load_config()
+            elif k == pygame.K_g:
+                self.snap = not self.snap
+            elif k == pygame.K_f:
+                self.fit_view()
+            elif k == pygame.K_TAB:
+                self.cycle(-1 if pygame.key.get_mods() & pygame.KMOD_SHIFT else 1)
+            elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                self.begin_edit()
+            elif k == pygame.K_ESCAPE:
+                self.sel = -1
+            elif k == pygame.K_LEFT:
+                self.nudge(-1, 0)
+            elif k == pygame.K_RIGHT:
+                self.nudge(1, 0)
+            elif k == pygame.K_UP:
+                self.nudge(0, -1)
+            elif k == pygame.K_DOWN:
+                self.nudge(0, 1)
+
+        elif e.type == pygame.MOUSEBUTTONDOWN:
+            mx, my = e.pos
+            if e.button == 1:
+                self.finish_edit(True)
+                if mx < vw:
+                    if self.img:
+                        ix, iy = self.to_img(mx, my)
+                        i = self.box_at(ix, iy)
+                        if i >= 0:
+                            self.sel = i
+                            self.ensure_visible()
+                            self.drag = (ix - self.boxes[i]["x"], iy - self.boxes[i]["y"])
+                        else:
+                            self.sel = -1
+                else:
+                    self.click_sidebar(mx, my)
+            elif e.button in (2, 3) and mx < vw:
+                self.panning = True
+
+        elif e.type == pygame.MOUSEBUTTONUP:
+            if e.button == 1:
+                self.drag = None
+            elif e.button in (2, 3):
+                self.panning = False
+
+        elif e.type == pygame.MOUSEMOTION:
+            if self.panning:
+                self.cam_x += e.rel[0]
+                self.cam_y += e.rel[1]
+                self.clamp_camera()
+            elif self.drag is not None and 0 <= self.sel < len(self.boxes):
+                ix, iy = self.to_img(*e.pos)
+                nx, ny = ix - self.drag[0], iy - self.drag[1]
+                if self.snap:
+                    nx, ny = snap_val(nx, BOX_W), snap_val(ny, BOX_H)
+                b = self.boxes[self.sel]
+                b["x"], b["y"] = int(nx), int(ny)
+                self.clamp_box(b)
+
+        elif e.type == pygame.MOUSEWHEEL:
+            mx, my = pygame.mouse.get_pos()
+            mods = pygame.key.get_mods()
+            if mx < vw and self.img:
+                if mods & pygame.KMOD_CTRL:
+                    ix, iy = self.to_img(mx, my)
+                    self.zoom = max(MIN_ZOOM, min(MAX_ZOOM, self.zoom * (1.25 ** e.y)))
+                    self.cam_x = mx - ix * self.zoom
+                    self.cam_y = my - iy * self.zoom
+                elif mods & pygame.KMOD_SHIFT:
+                    self.cam_x += e.y * 60
+                else:
+                    self.cam_y += e.y * 60
+                self.clamp_camera()
+            elif self.layout()["list"].collidepoint(mx, my):
+                self.list_scroll = max(0, min(self.list_scroll - int(e.y), len(self.boxes) - LIST_ROWS))
+
+    def click_sidebar(self, mx, my):
+        lay = self.layout()
+        if lay["label"].collidepoint(mx, my):
+            self.begin_edit()
+            return
+        if lay["list"].collidepoint(mx, my):
+            i = self.list_scroll + (my - lay["list"].y) // ROW_H
+            if 0 <= i < len(self.boxes):
+                self.sel = i
+            return
+        actions = [self.open_image, self.add_box, self.delete_box, self.export_all, self.save_config, self.load_config]
+        for rect, action in zip(lay["buttons"], actions):
+            if rect.collidepoint(mx, my):
+                action()
+                return
+
+    # ---------------------------------------------------------- preview of the selected box (as saved)
+    def update_preview(self):
+        if self.drag is not None:
+            return
+        if not (self.img and 0 <= self.sel < len(self.boxes)):
+            self.preview, self.preview_key = None, None
+            return
+        b = self.boxes[self.sel]
+        key = (id(self.img), b["x"], b["y"])
+        if key == self.preview_key:
+            return
+        self.preview_key = key
+        idx = crop_indices(self.img, b["x"], b["y"])
+        rgb = b"".join([PAL_BYTES[v] if v else CHECK_PIX[j] for j, v in enumerate(idx)])
+        self.preview = pygame.image.frombuffer(rgb, (BOX_W, BOX_H), "RGB").copy()
+
+    # ---------------------------------------------------------- drawing
+    def draw_image(self, vw, vh):
+        iw, ih = self.img.get_size()
+        sx0 = max(0, int(math.floor(-self.cam_x / self.zoom)))
+        sy0 = max(0, int(math.floor(-self.cam_y / self.zoom)))
+        sx1 = min(iw, int(math.ceil((vw - self.cam_x) / self.zoom)))
+        sy1 = min(ih, int(math.ceil((vh - self.cam_y) / self.zoom)))
+        if sx1 <= sx0 or sy1 <= sy0:
+            return
+        sub = self.img.subsurface((sx0, sy0, sx1 - sx0, sy1 - sy0))
+        dw = max(1, round((sx1 - sx0) * self.zoom))
+        dh = max(1, round((sy1 - sy0) * self.zoom))
+        self.screen.blit(pygame.transform.scale(sub, (dw, dh)),
+                         (round(self.cam_x + sx0 * self.zoom), round(self.cam_y + sy0 * self.zoom)))
+        # image border
+        pygame.draw.rect(self.screen, (90, 90, 90),
+                         (round(self.cam_x) - 1, round(self.cam_y) - 1,
+                          round(iw * self.zoom) + 2, round(ih * self.zoom) + 2), 1)
+
+    def draw_grid(self, vw, vh):
+        iw, ih = self.img.get_size()
+        z = self.zoom
+        col = (70, 70, 90)
+        top, bottom = round(self.cam_y), round(self.cam_y + ih * z)
+        left, right = round(self.cam_x), round(self.cam_x + iw * z)
+        for gx in range(0, iw + 1, BOX_W):
+            sx = round(self.cam_x + gx * z)
+            if 0 <= sx < vw:
+                pygame.draw.line(self.screen, col, (sx, top), (sx, bottom))
+        for gy in range(0, ih + 1, BOX_H):
+            sy = round(self.cam_y + gy * z)
+            if 0 <= sy < vh:
+                pygame.draw.line(self.screen, col, (left, sy), (right, sy))
+
+    def draw_boxes(self, vw, vh):
+        dups = self.duplicates()
+        for i, b in enumerate(self.boxes):
+            rect = pygame.Rect(round(self.cam_x + b["x"] * self.zoom), round(self.cam_y + b["y"] * self.zoom),
+                               round(BOX_W * self.zoom), round(BOX_H * self.zoom))
+            is_sel = i == self.sel
+            is_dup = (b["gx"], b["gy"]) in dups
+            col = (255, 70, 70) if is_dup else ((0, 255, 255) if is_sel else (255, 190, 0))
+            if is_sel:
+                tint = pygame.Surface((max(1, rect.w), max(1, rect.h)), pygame.SRCALPHA)
+                tint.fill((0, 255, 255, 40))
+                self.screen.blit(tint, rect.topleft)
+            pygame.draw.rect(self.screen, col, rect, 2)
+            label = self.font_bold.render(f"{b['gx']},{b['gy']}", True, col)
+            bg = label.get_rect(topleft=(rect.x + 2, rect.y + 2)).inflate(8, 4)
+            pygame.draw.rect(self.screen, (20, 20, 20), bg)
+            pygame.draw.rect(self.screen, col, bg, 1)
+            self.screen.blit(label, (bg.x + 4, bg.y + 2))
+
+    def draw_view(self, vw, vh):
+        self.screen.set_clip((0, 0, vw, vh))
+        if self.img:
+            self.draw_image(vw, vh)
+            if self.snap:
+                self.draw_grid(vw, vh)
+            self.draw_boxes(vw, vh)
+        else:
+            t = self.font_bold.render("Press O to open an image", True, (170, 170, 170))
+            self.screen.blit(t, t.get_rect(center=(vw // 2, vh // 2)))
+        # help bar
+        bar = pygame.Rect(0, vh - 56, vw, 56)
+        pygame.draw.rect(self.screen, (30, 30, 30), bar)
+        lines = ["A add box | click+drag move | Del delete | Enter edit label | Tab next | G grid snap | F fit | E export",
+                 "Ctrl+S save boxes (.xpconfig) | Shift+Ctrl+S save as | L load boxes",
+                 "arrows nudge (Shift 8px, Ctrl whole box) | Ctrl+Wheel zoom | Wheel scroll | middle/right drag pan"]
+        for i, s in enumerate(lines):
+            self.screen.blit(self.font_small.render(s, True, (190, 190, 190)), (10, vh - 52 + i * 16))
+        # status message
+        if pygame.time.get_ticks() < self.status_until:
+            t = self.font.render(self.status, True, (255, 255, 255))
+            r = t.get_rect(topleft=(12, 12)).inflate(12, 8)
+            pygame.draw.rect(self.screen, (20, 20, 20), r)
+            pygame.draw.rect(self.screen, (160, 160, 160), r, 1)
+            self.screen.blit(t, (r.x + 6, r.y + 4))
+        self.screen.set_clip(None)
+
+    def draw_sidebar(self):
+        lay = self.layout()
+        ux = lay["ux"]
+        w, h = self.screen.get_size()
+        pygame.draw.rect(self.screen, (40, 40, 40), (ux, 0, UI_WIDTH, h))
+        pygame.draw.line(self.screen, (80, 80, 80), (ux, 0), (ux, h), 2)
+
+        iw, ih = self.img.get_size() if self.img else (0, 0)
+        infos = [f"Image: {self.img_name}",
+                 f"Size: {iw}x{ih}",
+                 f"Zoom: {self.zoom * 100:.0f}%",
+                 f"Box: {BOX_W}x{BOX_H}   Grid snap: {'ON' if self.snap else 'off'}",
+                 f"Boxes: {len(self.boxes)}   Output: X,Y{EXT}"]
+        for i, t in enumerate(infos):
+            self.screen.blit(self.font.render(t, True, (255, 255, 255) if i == 0 else (200, 200, 200)),
+                             (ux + 15, 12 + i * 17))
+
+        # label field
+        have = 0 <= self.sel < len(self.boxes)
+        self.screen.blit(self.font.render("Label of selected box (X,Y):", True, (200, 200, 200)), (ux + 15, 112))
+        r = lay["label"]
+        pygame.draw.rect(self.screen, (80, 80, 120) if self.editing else (60, 60, 60), r, border_radius=4)
+        pygame.draw.rect(self.screen, (0, 255, 255) if self.editing else (150, 150, 150), r, 2, border_radius=4)
+        if self.editing:
+            txt = self.edit_str + ("_" if (pygame.time.get_ticks() // 400) % 2 == 0 else "")
+        elif have:
+            txt = f"{self.boxes[self.sel]['gx']},{self.boxes[self.sel]['gy']}"
+        else:
+            txt = "(no box selected)"
+        self.screen.blit(self.font.render(txt, True, (255, 255, 255)), (r.x + 8, r.y + 7))
+        if have:
+            b = self.boxes[self.sel]
+            inside = b["x"] >= 0 and b["y"] >= 0 and b["x"] + BOX_W <= iw and b["y"] + BOX_H <= ih
+            self.screen.blit(self.font_small.render(
+                f"position: {b['x']}, {b['y']}" + ("" if inside else "   (outside part = 0x00)"),
+                True, (150, 150, 150) if inside else (255, 190, 0)), (ux + 15, r.bottom + 3))
+
+        # box list
+        self.screen.blit(self.font.render("Boxes (click to select):", True, (200, 200, 200)), (ux + 15, 182))
+        lr = lay["list"]
+        pygame.draw.rect(self.screen, (30, 30, 30), lr)
+        dups = self.duplicates()
+        for row in range(LIST_ROWS):
+            i = self.list_scroll + row
+            if i >= len(self.boxes):
+                break
+            b = self.boxes[i]
+            rr = pygame.Rect(lr.x, lr.y + row * ROW_H, lr.w, ROW_H)
+            if i == self.sel:
+                pygame.draw.rect(self.screen, (0, 90, 110), rr)
+            col = (255, 90, 90) if (b["gx"], b["gy"]) in dups else (230, 230, 230)
+            self.screen.blit(self.font_small.render(f"{b['gx']},{b['gy']}{EXT}    @ {b['x']},{b['y']}", True, col),
+                             (rr.x + 6, rr.y + 2))
+        pygame.draw.rect(self.screen, (100, 100, 100), lr, 1)
+
+        # preview
+        self.screen.blit(self.font.render("Preview (as saved, checker = 0x00):", True, (200, 200, 200)), (ux + 15, 331))
+        pr = lay["preview"]
+        pygame.draw.rect(self.screen, (0, 0, 0), pr)
+        if self.preview:
+            self.screen.blit(self.preview, pr.topleft)
+        pygame.draw.rect(self.screen, (100, 100, 100), pr.inflate(2, 2), 1)
+
+        # buttons
+        for rect, (label, col) in zip(lay["buttons"], [("OPEN IMAGE (O)", (130, 70, 140)),
+                                                       ("ADD BOX (A)", (70, 130, 70)),
+                                                       ("DELETE (Del)", (140, 70, 70)),
+                                                       ("EXPORT .xpg (E)", (70, 70, 140)),
+                                                       ("SAVE (Ctrl+S)", (60, 110, 120)),
+                                                       ("LOAD BOXES (L)", (120, 110, 60))]):
+            pygame.draw.rect(self.screen, col, rect, border_radius=4)
+            pygame.draw.rect(self.screen, (200, 200, 200), rect, 1, border_radius=4)
+            t = self.font.render(label, True, (255, 255, 255))
+            self.screen.blit(t, t.get_rect(center=rect.center))
+
+    def draw(self):
+        vw, vh = self.view_size()
+        self.screen.fill((25, 25, 25))
+        self.draw_view(vw, vh)
+        self.draw_sidebar()
+        pygame.display.flip()
+
+    # ---------------------------------------------------------- main loop
+    def run(self):
+        while self.running:
+            for e in pygame.event.get():
+                self.handle_event(e)
+            if self.root:
+                try:
+                    self.root.update()
+                except tk.TclError:
+                    pass
+            self.update_preview()
+            self.draw()
+            self.clock.tick(60)
+        pygame.quit()
+
+
+if __name__ == "__main__":
+    App(sys.argv[1] if len(sys.argv) > 1 else None).run()
+    sys.exit()

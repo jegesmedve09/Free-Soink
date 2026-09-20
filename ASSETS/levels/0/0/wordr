@@ -1,0 +1,1577 @@
+#!/usr/bin/env python3
+"""
+worldr - drawr for a whole level.
+
+Point it at a project folder. It scans it for every "X,Y.<ext>" file whose extension ends
+with g (lvg, bcg, xpg, ...), each one a raw 320x224 8bpp screen, and lays them out on ONE big
+canvas at their X,Y positions. You paint on the level, not on a screen: a stroke that crosses
+from screen 2,1 into screen 3,1 just works, and every touched file is saved back on its own.
+
+  * every folder that directly holds X,Y.*g files is one "map" (levels/0/1, levels/0/2, ...)
+  * every extension inside a map is one "layer" (bcg under lvg, ...); you edit ONE layer at
+    a time, the others are shown underneath / above it and can be hidden
+  * index 0 (000) is transparent, so lower layers show through it (B = checker backdrop)
+  * painting on a screen that has no file yet creates it; it is written when you save
+    (a new screen that is still all 0x00 is never written)
+  * files that aren't exactly 320*224 = 71680 bytes are left alone and reported
+
+Controls
+  Mouse       LMB use tool | MMB or RMB drag = pan | Wheel scroll | Shift+Wheel sideways | Ctrl+Wheel zoom
+  T           cycle tool: draw > select > eraser > bucket > picker
+  E / Q       colour +1 / -1                 (click a swatch to pick one)
+  [ ]  1-9    choose the layer you edit      V  show / hide that layer
+  G           grid + X,Y labels              B  checker / black backdrop for transparent
+  F           fit the level in the window    + / -  zoom      arrows  pan
+  Ctrl+C/X/V  copy / cut / paste (active layer, works across screens)   Enter or click = stamp
+  Ctrl+Alt + drag inside a selection = move it      Del = clear selection     Esc = cancel/clear
+  Ctrl+Z / Ctrl+Y   undo / redo (per map, works across all the files a stroke touched)
+  I           import an image and stamp it (native size, quantised like cutr)
+  O           open project folder            S or Ctrl+S   save every changed file
+  F5          reload the folder from disk
+  PgUp/PgDn   previous / next map            F1  help
+
+Usage:  python3 worldr.py [project_folder]
+"""
+import math
+import os
+import re
+import sys
+import zlib
+
+import pygame
+
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+except ImportError:  # dialogs are optional, give the folder on the command line
+    tk = None
+
+# ------------------------------------------------------------------ config
+TILE_W, TILE_H = 320, 224
+TILE_BYTES = TILE_W * TILE_H
+MAX_CELL = 999                        # X and Y in a file name can't go above this
+LAYER_ORDER = ["bcg", "lvg"]          # bottom -> top. Any other *g extension is stacked on top, A-Z
+EXCLUDE_EXT = {"png", "jpg", "jpeg", "svg", "ogg"}   # end in g but are not tiles
+SKIP_DIRS = {"__pycache__", "node_modules"}
+SCAN_DEPTH = 6
+UI_WIDTH = 340
+SB = 14                               # scrollbar thickness
+ZOOMS = [0.125, 0.25, 0.5, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64]   # tile size stays a whole number of pixels
+MAX_UNDO = 200
+ALPHA_CUTOFF = 128                    # import: alpha below this -> index 0 (transparent)
+BLACK_REPLACEMENT = 8                 # import: an opaque pixel that would be 000 becomes 002 (000 = transparent)
+MAX_IMPORT_PIXELS = 40_000_000
+TOOLS = ["draw", "select", "eraser", "bucket", "picker"]
+
+# ------------------------------------------------------------------ palette (same table as drawr / animator / cutr)
+raw_data = """
+000 020 040 060 080 0A0 0C0 0E0
+002 022 042 062 082 0A2 0C2 0E2
+004 024 044 064 084 0A4 0C4 0E4
+006 026 046 066 086 0A6 0C6 0E6
+008 028 048 068 088 0A8 0C8 0E8
+00A 02A 04A 06A 08A 0AA 0CA 0EA
+00C 02C 04C 06C 08C 0AC 0CC 0EC
+00E 02E 04E 06E 08E 0AE 0CE 0EE
+400 420 440 460 480 4A0 4C0 4E0
+402 422 442 462 482 4A2 4C2 4E2
+404 424 444 464 484 4A4 4C4 4E4
+406 426 446 466 486 4A6 4C6 4E6
+408 428 448 468 488 4A8 4C8 4E8
+40A 42A 44A 46A 48A 4AA 4CA 4EA
+40C 42C 44C 46C 48C 4AC 4CC 4EC
+40E 42E 44E 46E 48E 4AE 4CE 4EE
+800 820 840 860 880 8A0 8C0 8E0
+802 822 842 862 882 8A2 8C2 8E2
+804 824 844 864 884 8A4 8C4 8E4
+806 826 846 866 886 8A6 8C6 8E6
+808 828 848 868 888 8A8 8C8 8E8
+80A 82A 84A 86A 88A 8AA 8CA 8EA
+80C 82C 84C 86C 88C 8AC 8CC 8EC
+80E 82E 84E 86E 88E 8AE 8CE 8EE
+C00 C20 C40 C60 C80 CA0 CC0 CE0
+C02 C22 C42 C62 C82 CA2 CC2 CE2
+C04 C24 C44 C64 C84 CA4 CC4 CE4
+C06 C26 C46 C66 C86 CA6 CC6 CE6
+C08 C28 C48 C68 C88 CA8 CC8 CE8
+C0A C2A C4A C6A C8A CAA CCA CEA
+C0C C2C C4C C6C C8C CAC CCC CEC
+C0E C2E C4E C6E C8E CAE CCE CEE
+"""
+palette_rgb = [(int(t[0], 16) << 4, int(t[1], 16) << 4, int(t[2], 16) << 4) for t in raw_data.split()]
+while len(palette_rgb) < 256:
+    palette_rgb.append((0, 0, 0))
+
+# ------------------------------------------------------------------ colour quantiser (from cutr, used by image import)
+R_LEVELS = [0, 64, 128, 192]
+G_LEVELS = B_LEVELS = [0, 32, 64, 96, 128, 160, 192, 224]
+
+
+def _palette_is_grid():
+    return all(palette_rgb[i] == (R_LEVELS[i >> 6], G_LEVELS[i & 7], B_LEVELS[(i >> 3) & 7]) for i in range(256))
+
+
+def _nearest_level(levels, v):
+    return min(range(len(levels)), key=lambda i: abs(levels[i] - v))
+
+
+FAST_QUANT = _palette_is_grid()
+if FAST_QUANT:
+    _RT = bytes(_nearest_level(R_LEVELS, v) * 64 for v in range(256))
+    _GT = bytes(_nearest_level(G_LEVELS, v) for v in range(256))
+    _BT = bytes(_nearest_level(B_LEVELS, v) * 8 for v in range(256))
+_slow_cache = {}
+
+
+def quantize_rgba(raw):
+    """RGBA bytes -> bytes of palette indices (alpha < cutoff -> 0, opaque black -> 002)."""
+    if FAST_QUANT:
+        rs = raw[0::4].translate(_RT)
+        gs = raw[1::4].translate(_GT)
+        bs = raw[2::4].translate(_BT)
+        al = raw[3::4]
+        return bytes(0 if a < ALPHA_CUTOFF else ((r + g + b) or BLACK_REPLACEMENT)
+                     for r, g, b, a in zip(rs, gs, bs, al))
+    out = bytearray(len(raw) // 4)
+    for i in range(len(out)):
+        r, g, b, a = raw[4 * i:4 * i + 4]
+        if a < ALPHA_CUTOFF:
+            continue
+        idx = _slow_cache.get((r, g, b))
+        if idx is None:
+            idx = min(range(256), key=lambda k: (r - palette_rgb[k][0]) ** 2 +
+                      (g - palette_rgb[k][1]) ** 2 + (b - palette_rgb[k][2]) ** 2)
+            idx = idx or BLACK_REPLACEMENT
+            _slow_cache[(r, g, b)] = idx
+        out[i] = idx
+    return bytes(out)
+
+
+_tobytes = getattr(pygame.image, "tobytes", None) or pygame.image.tostring
+
+
+# ------------------------------------------------------------------ project scan
+TILE_RE = re.compile(r"(\d+),(\d+)")
+
+
+def natural_key(s):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
+
+def layer_sort_key(ext):
+    if ext in LAYER_ORDER:
+        return (0, LAYER_ORDER.index(ext), ext)
+    return (1, 0, ext)
+
+
+def scan_project(root):
+    """Walk `root`. Returns (maps, notes).
+
+    maps  = {folder: {ext_lowercase: {"disp": ext as written, "files": {(x, y): path}}}}
+    notes = list of human readable warnings (wrong size, duplicates)
+    """
+    maps, wrong_size, dups = {}, [], 0
+    root = os.path.abspath(root)
+    base = root.rstrip(os.sep).count(os.sep)
+    for dirpath, dirnames, filenames in os.walk(root):
+        if dirpath.count(os.sep) - base >= SCAN_DEPTH:
+            dirnames[:] = []
+        else:
+            dirnames[:] = sorted((d for d in dirnames if not d.startswith(".") and d not in SKIP_DIRS),
+                                 key=natural_key)
+        for fn in filenames:
+            stem, ext = os.path.splitext(fn)
+            e = ext[1:]
+            if not e or not e.lower().endswith("g") or e.lower() in EXCLUDE_EXT:
+                continue
+            m = TILE_RE.fullmatch(stem)
+            if not m:
+                continue
+            x, y = int(m.group(1)), int(m.group(2))
+            if x > MAX_CELL or y > MAX_CELL:
+                continue
+            path = os.path.join(dirpath, fn)
+            try:
+                if os.path.getsize(path) != TILE_BYTES:
+                    wrong_size.append(path)
+                    continue
+            except OSError:
+                continue
+            layer = maps.setdefault(dirpath, {}).setdefault(e.lower(), {"disp": e, "files": {}})
+            if (x, y) in layer["files"]:
+                dups += 1
+                continue
+            layer["files"][(x, y)] = path
+    notes = []
+    if wrong_size:
+        notes.append(f"{len(wrong_size)} file(s) skipped: not {TILE_BYTES} bytes (e.g. {os.path.basename(wrong_size[0])})")
+    if dups:
+        notes.append(f"{dups} duplicate file(s) ignored (same X,Y and extension, different letter case)")
+    return maps, notes
+
+
+# ------------------------------------------------------------------ data model
+class Tile:
+    """One 320x224 screen of one layer."""
+    __slots__ = ("data", "path", "dirty", "version", "_surf", "_surf_ver", "_buf", "_scaled")
+
+    def __init__(self, data=None, path=None):
+        self.data = data if data is not None else bytearray(TILE_BYTES)
+        self.path = path
+        self.dirty = False
+        self.version = 0          # bumped on every change; surfaces are rebuilt when it moves
+        self._surf = None
+        self._surf_ver = -1
+        self._buf = None
+        self._scaled = None
+
+    def surface(self):
+        """8-bit palettised surface of the tile, index 0 = colour key (transparent)."""
+        if self._surf_ver != self.version:
+            self._buf = bytes(self.data)
+            s = pygame.image.frombuffer(self._buf, (TILE_W, TILE_H), "P")
+            s.set_palette(palette_rgb)
+            s.set_colorkey(0)
+            self._surf, self._surf_ver = s, self.version
+        return self._surf
+
+    def scaled(self, zoom):
+        """Cached down-scaled surface for zoom < 1."""
+        c = self._scaled
+        if c and c[0] == zoom and c[1] == self.version:
+            return c[2]
+        sc = pygame.transform.scale(self.surface(), (int(TILE_W * zoom), int(TILE_H * zoom)))
+        sc.set_colorkey(0)
+        self._scaled = (zoom, self.version, sc)
+        return sc
+
+
+class Layer:
+    def __init__(self, ext, disp):
+        self.ext = ext            # lowercase key
+        self.disp = disp          # extension as it is written on disk (used for new files)
+        self.tiles = {}           # (cx, cy) -> Tile
+        self.visible = True
+
+
+def line_points(x0, y0, x1, y1):
+    """Bresenham, both ends included."""
+    dx, dy = abs(x1 - x0), -abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx + dy
+    while True:
+        yield x0, y0
+        if x0 == x1 and y0 == y1:
+            return
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x0 += sx
+        if e2 <= dx:
+            err += dx
+            y0 += sy
+
+
+def pieces(x, y, w, h):
+    """Split the world rectangle (x, y, w, h) into per-screen pieces.
+
+    yields (cx, cy, tx, ty, pw, ph, dx, dy): screen cell, position inside that screen, size of the
+    piece, and its offset inside the rectangle. Anything left of / above 0 or beyond MAX_CELL is dropped.
+    """
+    x0, y0 = max(x, 0), max(y, 0)
+    x1, y1 = min(x + w, (MAX_CELL + 1) * TILE_W), min(y + h, (MAX_CELL + 1) * TILE_H)
+    if x1 <= x0 or y1 <= y0:
+        return
+    cy = y0 // TILE_H
+    while cy * TILE_H < y1:
+        cx = x0 // TILE_W
+        while cx * TILE_W < x1:
+            ax0, ax1 = max(x0, cx * TILE_W), min(x1, (cx + 1) * TILE_W)
+            ay0, ay1 = max(y0, cy * TILE_H), min(y1, (cy + 1) * TILE_H)
+            yield cx, cy, ax0 - cx * TILE_W, ay0 - cy * TILE_H, ax1 - ax0, ay1 - ay0, ax0 - x, ay0 - y
+            cx += 1
+        cy += 1
+
+
+class GameMap:
+    """All the layers of one folder, editable as one big canvas, with its own undo history."""
+
+    def __init__(self, name, folder, spec):
+        self.name, self.folder, self.spec = name, folder, spec
+        self.layers = []
+        self.loaded = False
+        self.undo, self.redo, self.cur = [], [], None
+        self._bbox = None         # None = stale, False = no tiles at all
+        self.view = None          # (zoom, ox, oy) remembered while another map is shown
+        self.active = None        # index of the layer being edited
+
+    # ---------------------------------------------------------- loading / saving
+    def load(self):
+        errors = []
+        for ext in sorted(self.spec, key=layer_sort_key):
+            info = self.spec[ext]
+            layer = Layer(ext, info["disp"])
+            for cell, path in info["files"].items():
+                try:
+                    with open(path, "rb") as f:
+                        data = f.read()
+                    if len(data) != TILE_BYTES:
+                        raise ValueError(f"{len(data)} bytes")
+                    layer.tiles[cell] = Tile(bytearray(data), path)
+                except (OSError, ValueError) as e:
+                    errors.append(f"{os.path.basename(path)}: {e}")
+            self.layers.append(layer)
+        self.loaded = True
+        self._bbox = None
+        return errors
+
+    def dirty_count(self):
+        return sum(1 for l in self.layers for t in l.tiles.values() if t.dirty)
+
+    def save(self):
+        """Write every changed screen. Returns (files_written, error_strings)."""
+        written, errors = 0, []
+        for layer in self.layers:
+            for (cx, cy), t in layer.tiles.items():
+                if not t.dirty:
+                    continue
+                path = t.path
+                if path is None:
+                    if t.data.count(0) == TILE_BYTES:      # brand new and still blank: no file
+                        t.dirty = False
+                        continue
+                    path = os.path.join(self.folder, f"{cx},{cy}.{layer.disp}")
+                    if os.path.exists(path):
+                        errors.append(f"{cx},{cy}.{layer.disp}: a file with that name exists but couldn't be loaded - not overwritten")
+                        continue
+                try:
+                    tmp = path + ".tmp"
+                    with open(tmp, "wb") as f:
+                        f.write(t.data)
+                    os.replace(tmp, path)
+                except OSError as e:
+                    errors.append(f"{os.path.basename(path)}: {e}")
+                    continue
+                t.path, t.dirty = path, False
+                written += 1
+            blank = [c for c, t in layer.tiles.items() if t.path is None and not t.dirty]
+            for c in blank:                       # blank screens that never got a file: forget them
+                del layer.tiles[c]
+            if blank:
+                self._bbox = None
+        return written, errors
+
+    # ---------------------------------------------------------- geometry
+    def cells_bbox(self):
+        """(cx0, cy0, cx1, cy1) over the screens of ALL layers, or None."""
+        if self._bbox is None:
+            xs = [c[0] for l in self.layers for c in l.tiles]
+            ys = [c[1] for l in self.layers for c in l.tiles]
+            self._bbox = (min(xs), min(ys), max(xs), max(ys)) if xs else False
+        return self._bbox or None
+
+    # ---------------------------------------------------------- undo machinery
+    def begin(self):
+        if self.cur is None:
+            self.cur = {}
+
+    def end(self):
+        if self.cur:
+            self.undo.append(self.cur)
+            del self.undo[:-MAX_UNDO]
+            self.redo.clear()
+        self.cur = None
+
+    def _touch(self, layer, cell):
+        """Remember what this screen looked like before the first change of the current step."""
+        if self.cur is None:
+            self.cur = {}
+        key = (layer.ext, cell[0], cell[1])
+        if key not in self.cur:
+            t = layer.tiles.get(cell)
+            self.cur[key] = None if t is None else zlib.compress(bytes(t.data), 1)
+
+    def _writable(self, layer, cell):
+        self._touch(layer, cell)
+        t = layer.tiles.get(cell)
+        if t is None:
+            t = layer.tiles[cell] = Tile()
+            self._bbox = None
+        return t
+
+    def _swap(self, change):
+        """Restore the snapshots in `change`; returns the snapshots of what was there before."""
+        inv = {}
+        for (ext, cx, cy), snap in change.items():
+            layer = next(l for l in self.layers if l.ext == ext)
+            t = layer.tiles.get((cx, cy))
+            inv[(ext, cx, cy)] = None if t is None else zlib.compress(bytes(t.data), 1)
+            if snap is None:
+                if t is None:
+                    continue
+                if t.path is None:               # never reached the disk: really remove it again
+                    del layer.tiles[(cx, cy)]
+                    self._bbox = None
+                    continue
+                t.data[:] = bytes(TILE_BYTES)    # it has a file: keep it, blank
+            else:
+                if t is None:
+                    t = layer.tiles[(cx, cy)] = Tile()
+                    self._bbox = None
+                t.data[:] = zlib.decompress(snap)
+            t.dirty = True
+            t.version += 1
+        return inv
+
+    def do_undo(self):
+        self.end()
+        if not self.undo:
+            return 0
+        change = self.undo.pop()
+        self.redo.append(self._swap(change))
+        return len(change)
+
+    def do_redo(self):
+        self.end()
+        if not self.redo:
+            return 0
+        change = self.redo.pop()
+        self.undo.append(self._swap(change))
+        return len(change)
+
+    # ---------------------------------------------------------- pixel access (world coordinates)
+    def get_px(self, layer, wx, wy):
+        if wx < 0 or wy < 0:
+            return 0
+        t = layer.tiles.get((wx // TILE_W, wy // TILE_H))
+        return 0 if t is None else t.data[(wy % TILE_H) * TILE_W + wx % TILE_W]
+
+    def set_px(self, layer, wx, wy, v):
+        if wx < 0 or wy < 0:
+            return False
+        cx, tx = divmod(wx, TILE_W)
+        cy, ty = divmod(wy, TILE_H)
+        if cx > MAX_CELL or cy > MAX_CELL:
+            return False
+        i = ty * TILE_W + tx
+        t = layer.tiles.get((cx, cy))
+        if t is None:
+            if v == 0:                       # transparent on a screen that doesn't exist: nothing to do
+                return False
+        elif t.data[i] == v:
+            return False
+        t = self._writable(layer, (cx, cy))
+        t.data[i] = v
+        t.dirty = True
+        t.version += 1
+        return True
+
+    def read_region(self, layer, x, y, w, h):
+        out = bytearray(w * h)
+        for cx, cy, tx, ty, pw, ph, dx, dy in pieces(x, y, w, h):
+            t = layer.tiles.get((cx, cy))
+            if t is None:
+                continue
+            for r in range(ph):
+                s = (ty + r) * TILE_W + tx
+                d = (dy + r) * w + dx
+                out[d:d + pw] = t.data[s:s + pw]
+        return out
+
+    def write_region(self, layer, x, y, w, h, data):
+        """Overwrite the rectangle with `data` (w*h bytes, index 0 included, like drawr's paste)."""
+        for cx, cy, tx, ty, pw, ph, dx, dy in pieces(x, y, w, h):
+            t = layer.tiles.get((cx, cy))
+            touched = False
+            for r in range(ph):
+                s = (ty + r) * TILE_W + tx
+                d = (dy + r) * w + dx
+                new = data[d:d + pw]
+                if t is None:
+                    if new.count(0) == pw:
+                        continue
+                elif t.data[s:s + pw] == new:
+                    continue
+                t = self._writable(layer, (cx, cy))
+                t.data[s:s + pw] = new
+                touched = True
+            if touched:
+                t.dirty = True
+                t.version += 1
+
+    def flood_fill(self, layer, wx, wy, new):
+        """Scanline fill on one layer, limited to the level's extent. Returns 'ok', 'same' or 'outside'."""
+        bb = self.cells_bbox()
+        cx, cy = wx // TILE_W, wy // TILE_H
+        if wx < 0 or wy < 0 or bb is None or not (bb[0] <= cx <= bb[2] and bb[1] <= cy <= bb[3]):
+            return "outside"
+        ncols, nrows = bb[2] - bb[0] + 1, bb[3] - bb[1] + 1
+        W, H = ncols * TILE_W, nrows * TILE_H
+        lx, ly = wx - bb[0] * TILE_W, wy - bb[1] * TILE_H
+        rows = {}                                    # local y -> [original bytes, working bytearray]
+
+        def row(y):
+            r = rows.get(y)
+            if r is None:
+                buf = bytearray(W)
+                cell_y, ty = bb[1] + y // TILE_H, y % TILE_H
+                for c in range(ncols):
+                    t = layer.tiles.get((bb[0] + c, cell_y))
+                    if t is not None:
+                        buf[c * TILE_W:(c + 1) * TILE_W] = t.data[ty * TILE_W:(ty + 1) * TILE_W]
+                r = rows[y] = [bytes(buf), buf]
+            return r[1]
+
+        target = row(ly)[lx]
+        if target == new:
+            return "same"
+        tb, nb = bytes([target]), bytes([new])
+        run = re.compile(re.escape(tb) + b"+")
+        stack = [(lx, ly)]
+        while stack:
+            x, y = stack.pop()
+            w = row(y)
+            if w[x] != target:
+                continue
+            left = len(w[:x + 1].rstrip(tb))
+            seg = w[x:]
+            right = x + len(seg) - len(seg.lstrip(tb))
+            w[left:right] = nb * (right - left)
+            for ny in (y - 1, y + 1):
+                if 0 <= ny < H:
+                    for m in run.finditer(row(ny), left, right):
+                        stack.append((m.start(), ny))
+        touched = set()
+        for y, (orig, work) in rows.items():
+            if work == orig:
+                continue
+            cell_y, ty = bb[1] + y // TILE_H, y % TILE_H
+            for c in range(ncols):
+                a, b = c * TILE_W, (c + 1) * TILE_W
+                if work[a:b] != orig[a:b]:
+                    t = self._writable(layer, (bb[0] + c, cell_y))
+                    t.data[ty * TILE_W:(ty + 1) * TILE_W] = work[a:b]
+                    touched.add(t)
+        for t in touched:
+            t.dirty = True
+            t.version += 1
+        return "ok"
+
+
+# ------------------------------------------------------------------ app
+HELP_LINES = [
+    "WORLDR - every X,Y.*g file of the map sits on one canvas",
+    "",
+    "Mouse   LMB = tool     MMB / RMB drag = pan     Wheel = scroll",
+    "        Shift+Wheel = sideways     Ctrl+Wheel = zoom at the mouse",
+    "T       cycle tool  (draw, select, eraser, bucket, picker)",
+    "E / Q   colour +1 / -1  (or click a swatch)",
+    "[ ]  1-9    choose the layer you edit        V   show / hide it",
+    "G   grid + X,Y labels (yellow = this layer has a file there)",
+    "B   checker / black backdrop for transparent (000)",
+    "F   fit level in window     + / -  zoom     arrows  pan",
+    "Ctrl+C / X / V   copy / cut / paste  (active layer, across screens)",
+    "Enter or click   stamp the paste        Esc  cancel / clear selection",
+    "Ctrl+Alt + drag inside selection   move it        Del   clear selection",
+    "Ctrl+Z / Ctrl+Y   undo / redo (whole strokes, across files)",
+    "I   import image, stamped at native size (000 stays transparent, black -> 002)",
+    "O   open project folder      S or Ctrl+S   save all changed files",
+    "F5  reload the folder from disk (after cutr exported new files, say)",
+    "PgUp / PgDn   previous / next map",
+    "",
+    "Painting on a screen with no file creates it on save.",
+    "Bucket works on the active layer, inside the level's extent only.",
+    "Picker takes the colour you SEE (top visible layer).",
+    "",
+    "F1 closes this",
+]
+
+
+class App:
+    def __init__(self):
+        pygame.init()
+        self.tkroot = None
+        if tk:
+            try:
+                self.tkroot = tk.Tk()
+                self.tkroot.withdraw()
+                self.tkroot.update()
+            except tk.TclError:
+                self.tkroot = None
+        info = pygame.display.Info()
+        size = (max(UI_WIDTH + 400, min(1300, info.current_w - 60)), max(700, min(860, info.current_h - 100)))
+        self.screen = pygame.display.set_mode(size, pygame.RESIZABLE)
+        self.clock = pygame.time.Clock()
+        self.font = pygame.font.SysFont(None, 20)
+        self.font_small = pygame.font.SysFont(None, 18)
+        self.font_bold = pygame.font.SysFont(None, 22, bold=True)
+
+        self.root = None
+        self.maps = []
+        self.mi = 0
+        self.zoom, self.ox, self.oy = 1, 20, 20
+
+        self.tool = "draw"
+        self.color = 0
+        self.show_grid = True
+        self.checker_bg = False
+        self.show_help = False
+        self.mouse = pygame.mouse.get_pos()
+
+        self.stroking = False
+        self.last = None
+        self.panning = False
+        self.drag_bar = None
+        self.selection_start = None
+        self.selection_box = None            # [x, y, w, h] in world pixels
+        self.clipboard = None                # {'w', 'h', 'data'}
+        self.is_pasting = False
+        self.paste_x = self.paste_y = 0
+        self.is_moving = False
+        self.move_buffer = None
+        self.move_x = self.move_y = 0
+        self.grab_ox = self.grab_oy = 0
+
+        self.status, self.status_until = "", 0
+        self.quit_armed = 0                  # ticks until which a second 'discard' request is accepted
+        self.running = True
+        self._ghost = None
+        self._checker = None
+        self._caption = None
+
+    # ---------------------------------------------------------- small helpers
+    @property
+    def map(self):
+        return self.maps[self.mi] if self.maps else None
+
+    @property
+    def layer(self):
+        m = self.map
+        if m and m.active is not None and 0 <= m.active < len(m.layers):
+            return m.layers[m.active]
+        return None
+
+    def say(self, msg, ms=6000):
+        self.status = msg
+        self.status_until = pygame.time.get_ticks() + ms
+        print(msg)
+
+    def mods(self):
+        return pygame.key.get_mods()
+
+    def dirty_count(self):
+        return sum(m.dirty_count() for m in self.maps)
+
+    def editable(self):
+        l = self.layer
+        if l is None:
+            self.say("Nothing to edit - press O to open a project folder")
+            return False
+        if not l.visible:
+            self.say(f"Layer .{l.disp} is hidden - press V to show it")
+            return False
+        return True
+
+    def to_world(self, pos):
+        return int((pos[0] - self.ox) // self.zoom), int((pos[1] - self.oy) // self.zoom)
+
+    def to_screen(self, wx, wy):
+        return int(round(self.ox + wx * self.zoom)), int(round(self.oy + wy * self.zoom))
+
+    # ---------------------------------------------------------- layout (shared by drawing and clicking)
+    def layout(self):
+        w, h = self.screen.get_size()
+        ux = w - UI_WIDTH
+        L = {"ux": ux, "w": w, "h": h}
+        L["view"] = pygame.Rect(0, 0, ux - SB, h - SB)
+        L["vbar"] = pygame.Rect(ux - SB, 0, SB, h - SB)
+        L["hbar"] = pygame.Rect(0, h - SB, ux - SB, SB)
+        bx, bw = ux + 15, UI_WIDTH - 30
+        btn_y = h - 10 - 3 * 35
+        L["buttons"] = [pygame.Rect(bx, btn_y + i * 35, bw, 30) for i in range(3)]
+        cell = 16 if h >= 780 else 12                 # smaller swatches on short windows so the lists still fit
+        L["cell"] = cell
+        L["pal"] = pygame.Rect(bx, btn_y - 10 - 16 * cell, 16 * cell, 16 * cell)
+        y = 12 + 12 * 17 + 4
+        avail = L["pal"].top - y - 6
+        n_l = len(self.map.layers) if self.map else 0
+        n_m = len(self.maps) if len(self.maps) > 1 else 0
+        rl, rm = min(n_l, 6), min(n_m, 5)
+
+        def need(r_l, r_m):
+            return (18 + r_l * 18 if r_l else 0) + (24 + r_m * 18 if r_m else 0)
+        while need(rl, rm) > avail and (rl > 1 or rm > 1):
+            if rm >= rl and rm > 1:
+                rm -= 1
+            else:
+                rl -= 1
+        L["layers_hdr"] = y
+        y += 18
+        L["layer_rows"] = []
+        for i in range(rl):
+            r = pygame.Rect(bx, y + i * 18, bw, 17)
+            L["layer_rows"].append((i, r, pygame.Rect(r.x, r.y, 22, r.h)))
+        y += rl * 18
+        L["maps_hdr"] = y + 6
+        y += 24 if rm else 0
+        L["map_rows"] = []
+        first = 0
+        if rm and self.mi >= rm:
+            first = min(self.mi - rm // 2, n_m - rm)
+            first = max(0, first)
+        L["map_first"], L["map_n"] = first, n_m
+        for i in range(rm):
+            L["map_rows"].append((first + i, pygame.Rect(bx, y + i * 18, bw, 17)))
+        return L
+
+    # ---------------------------------------------------------- project / maps
+    def open_project(self, path):
+        path = os.path.abspath(path)
+        if not os.path.isdir(path):
+            self.say(f"Not a folder: {path}")
+            return False
+        found, notes = scan_project(path)
+        if not found:
+            self.say("No X,Y.*g tile files found in " + path + (" (" + "; ".join(notes) + ")" if notes else ""))
+            return False
+        maps = []
+        for folder in sorted(found, key=lambda f: natural_key(os.path.relpath(f, path))):
+            name = os.path.relpath(folder, path)
+            maps.append(GameMap("(project root)" if name == "." else name.replace(os.sep, "/"), folder, found[folder]))
+        self.cancel_transient()
+        self.root, self.maps, self.mi = path, maps, 0
+        self._enter_map()
+        msg = f"Opened {os.path.basename(path) or path}: {len(maps)} map(s)"
+        if notes:
+            msg += " | " + "; ".join(notes)
+        self.say(msg)
+        return True
+
+    def _enter_map(self):
+        m = self.map
+        if not m.loaded:
+            errs = m.load()
+            if errs:
+                self.say(f"{len(errs)} file(s) failed to load: " + "; ".join(errs[:3]))
+            m.active = next((k for k, l in enumerate(m.layers) if l.ext == "lvg"), len(m.layers) - 1) if m.layers else None
+        if m.view:
+            self.zoom, self.ox, self.oy = m.view
+            self.clamp_camera()
+        else:
+            self.fit_view()
+
+    def switch_map(self, i):
+        if not self.maps or i == self.mi or not (0 <= i < len(self.maps)):
+            return
+        self.cancel_transient()
+        self.map.view = (self.zoom, self.ox, self.oy)
+        self.mi = i
+        self._enter_map()
+
+    def set_layer(self, i):
+        m = self.map
+        if m and 0 <= i < len(m.layers):
+            self.cancel_transient(keep_selection=True)
+            m.active = i
+            m.layers[i].visible = True
+
+    def cancel_transient(self, keep_selection=False):
+        if self.is_moving:
+            self.commit_move()
+        self.is_pasting = False
+        if not keep_selection:
+            self.selection_start = self.selection_box = None
+        self.stroking = False
+        self.last = None
+        if self.map:
+            self.map.end()
+
+    # ---------------------------------------------------------- camera
+    def scroll_bounds(self):
+        bb = self.map.cells_bbox() if self.map else None
+        bb = bb or (0, 0, 0, 0)
+        return (max(-TILE_W, (bb[0] - 2) * TILE_W), (bb[2] + 3) * TILE_W,
+                max(-TILE_H, (bb[1] - 2) * TILE_H), (bb[3] + 3) * TILE_H)
+
+    def clamp_camera(self):
+        view = self.layout()["view"]
+        x_lo, x_hi, y_lo, y_hi = self.scroll_bounds()
+        z = self.zoom
+        self.ox = int(max(50 - x_hi * z, min(view.w - 50 - x_lo * z, self.ox)))
+        self.oy = int(max(50 - y_hi * z, min(view.h - 50 - y_lo * z, self.oy)))
+
+    def fit_view(self):
+        view = self.layout()["view"]
+        bb = (self.map.cells_bbox() if self.map else None) or (0, 0, 0, 0)
+        w, h = (bb[2] - bb[0] + 1) * TILE_W, (bb[3] - bb[1] + 1) * TILE_H
+        z = ZOOMS[0]
+        for cand in ZOOMS:
+            if w * cand <= view.w - 30 and h * cand <= view.h - 30:
+                z = cand
+        self.zoom = z
+        self.ox = int((view.w - w * z) // 2 - bb[0] * TILE_W * z)
+        self.oy = int((view.h - h * z) // 2 - bb[1] * TILE_H * z)
+        self.clamp_camera()
+
+    def set_zoom(self, new_z, anchor=None):
+        if new_z == self.zoom:
+            return
+        view = self.layout()["view"]
+        ax, ay = anchor if anchor else view.center
+        wx, wy = (ax - self.ox) / self.zoom, (ay - self.oy) / self.zoom
+        self.zoom = new_z
+        self.ox, self.oy = int(round(ax - wx * new_z)), int(round(ay - wy * new_z))
+        self.clamp_camera()
+
+    def step_zoom(self, step, anchor=None):
+        i = ZOOMS.index(self.zoom) if self.zoom in ZOOMS else ZOOMS.index(1)
+        self.set_zoom(ZOOMS[max(0, min(len(ZOOMS) - 1, i + step))], anchor)
+
+    def bar_geom(self, axis):
+        L = self.layout()
+        x_lo, x_hi, y_lo, y_hi = self.scroll_bounds()
+        if axis == "h":
+            lo, hi, vis, pos, track = x_lo, x_hi, L["view"].w / self.zoom, -self.ox / self.zoom, L["hbar"].w
+        else:
+            lo, hi, vis, pos, track = y_lo, y_hi, L["view"].h / self.zoom, -self.oy / self.zoom, L["vbar"].h
+        total = hi - lo
+        if vis >= total:
+            return None
+        thumb = max(20, int(track * vis / total))
+        frac = max(0.0, min(1.0, (pos - lo) / (total - vis)))
+        return track, thumb, frac, lo, total, vis
+
+    def drag_scroll(self, axis, m):
+        g = self.bar_geom(axis)
+        if not g:
+            return
+        track, thumb, _, lo, total, vis = g
+        f = max(0.0, min(1.0, (m - thumb / 2) / max(1, track - thumb)))
+        pos = lo + f * (total - vis)
+        if axis == "h":
+            self.ox = int(round(-pos * self.zoom))
+        else:
+            self.oy = int(round(-pos * self.zoom))
+        self.clamp_camera()
+
+    # ---------------------------------------------------------- editing actions
+    def stroke_to(self, wx, wy):
+        layer = self.layer
+        v = self.color if self.tool == "draw" else 0
+        x0, y0 = self.last if self.last else (wx, wy)
+        for x, y in line_points(x0, y0, wx, wy):
+            self.map.set_px(layer, x, y, v)
+        self.last = (wx, wy)
+
+    def pick_color(self, wx, wy):
+        for layer in reversed(self.map.layers):
+            if layer.visible:
+                v = self.map.get_px(layer, wx, wy)
+                if v:
+                    self.color = v
+                    return
+        self.color = 0
+
+    def do_fill(self, wx, wy):
+        m = self.map
+        m.begin()
+        res = m.flood_fill(self.layer, wx, wy, self.color)
+        m.end()
+        if res == "outside":
+            self.say("Bucket only works inside the level's extent (paint a first pixel to add a screen there)")
+
+    def update_selection(self, pos):
+        wx, wy = self.to_world(pos)
+        sx0, sy0 = self.selection_start
+        x, y = max(0, min(sx0, wx)), max(0, min(sy0, wy))
+        self.selection_box = [x, y, max(sx0, wx) - x + 1, max(sy0, wy) - y + 1]
+
+    def copy_selection(self, quiet=False):
+        if not self.selection_box or not self.layer:
+            self.say("No selection to copy!")
+            return False
+        x, y, w, h = self.selection_box
+        self.clipboard = {"w": w, "h": h, "data": bytes(self.map.read_region(self.layer, x, y, w, h))}
+        if not quiet:
+            self.say(f"Copied {w}x{h}")
+        return True
+
+    def clear_selection_pixels(self):
+        x, y, w, h = self.selection_box
+        m = self.map
+        m.begin()
+        m.write_region(self.layer, x, y, w, h, bytes(w * h))
+        m.end()
+
+    def cut_selection(self):
+        if self.editable() and self.copy_selection(quiet=True):
+            self.clear_selection_pixels()
+            self.say("Cut selection")
+
+    def start_paste(self):
+        if not self.clipboard:
+            self.say("Clipboard is empty!")
+            return
+        if not self.editable():
+            return
+        view = self.layout()["view"]
+        pos = self.mouse if view.collidepoint(self.mouse) else view.center
+        self.paste_x, self.paste_y = self.to_world(pos)
+        self.is_pasting = True
+        self.say("Paste mode: click or Enter to stamp, Esc to cancel")
+
+    def commit_paste(self):
+        if self.is_pasting and self.clipboard and self.editable():
+            c = self.clipboard
+            m = self.map
+            m.begin()
+            m.write_region(self.layer, self.paste_x, self.paste_y, c["w"], c["h"], c["data"])
+            m.end()
+            self.is_pasting = False
+            self.say("Stamped")
+
+    def start_move(self, wx, wy):
+        if not self.selection_box or not self.editable():
+            return
+        sx, sy, sw, sh = self.selection_box
+        if not (sx <= wx < sx + sw and sy <= wy < sy + sh):
+            return
+        m = self.map
+        m.begin()
+        self.move_buffer = {"w": sw, "h": sh, "data": bytes(m.read_region(self.layer, sx, sy, sw, sh))}
+        m.write_region(self.layer, sx, sy, sw, sh, bytes(sw * sh))
+        self.is_moving = True
+        self.move_x, self.move_y = sx, sy
+        self.grab_ox, self.grab_oy = wx - sx, wy - sy
+        self.selection_box = None
+
+    def commit_move(self):
+        if not self.is_moving or not self.move_buffer:
+            self.is_moving = False
+            return
+        b = self.move_buffer
+        m = self.map
+        m.write_region(self.layer, self.move_x, self.move_y, b["w"], b["h"], b["data"])
+        m.end()
+        self.selection_box = [self.move_x, self.move_y, b["w"], b["h"]]
+        self.is_moving = False
+        self.move_buffer = None
+
+    def do_undo(self, redo=False):
+        if not self.map or self.stroking or self.is_moving:
+            return
+        self.is_pasting = False
+        n = self.map.do_redo() if redo else self.map.do_undo()
+        self.say(("Redid" if redo else "Undid") + f" a change to {n} screen file(s)" if n
+                 else ("Nothing to redo" if redo else "Nothing to undo"))
+
+    def save_all(self):
+        if not self.maps:
+            return
+        self.cancel_transient(keep_selection=True)
+        written, errors = 0, []
+        for m in self.maps:
+            if m.loaded:
+                w, e = m.save()
+                written += w
+                errors += e
+        self.quit_armed = 0
+        msg = f"Saved {written} file(s)"
+        if errors:
+            msg += f" - {len(errors)} problem(s): " + "; ".join(errors[:2])
+        self.say(msg, 9000 if errors else 5000)
+
+    def ask_folder(self):
+        if not self.tkroot:
+            self.say("No tkinter here - start worldr with the project folder as an argument")
+            return None
+        return filedialog.askdirectory(master=self.tkroot, title="Open project folder") or None
+
+    def ask_image(self):
+        if not self.tkroot:
+            self.say("No tkinter here - can't show a file dialog")
+            return None
+        return filedialog.askopenfilename(
+            master=self.tkroot, title="Import image",
+            filetypes=[("Image Files", "*.png *.jpg *.jpeg *.bmp *.gif *.tga *.webp"), ("All Files", "*.*")]) or None
+
+    def maybe_save_first(self):
+        """True if it's fine to throw the current project away."""
+        n = self.dirty_count()
+        if n == 0:
+            return True
+        if self.tkroot:
+            ans = messagebox.askyesnocancel("worldr", f"{n} screen file(s) have unsaved changes.\n\nSave them first?",
+                                            master=self.tkroot)
+            if ans is None:
+                return False
+            if ans:
+                self.save_all()
+                return self.dirty_count() == 0
+            return True
+        if pygame.time.get_ticks() < self.quit_armed:
+            return True
+        self.quit_armed = pygame.time.get_ticks() + 10000
+        self.say(f"{n} unsaved screen file(s) - press S to save, or do it again to discard", 9000)
+        return False
+
+    def open_dialog(self):
+        if not self.maybe_save_first():
+            return
+        path = self.ask_folder()
+        if path:
+            self.open_project(path)
+
+    def import_image(self):
+        if not self.editable():
+            return
+        path = self.ask_image()
+        if not path:
+            return
+        try:
+            surf = pygame.image.load(path).convert_alpha()
+            w, h = surf.get_size()
+            if w * h > MAX_IMPORT_PIXELS:
+                self.say(f"Image is too big ({w}x{h})")
+                return
+            data = quantize_rgba(_tobytes(surf, "RGBA"))
+        except Exception as e:
+            self.say(f"Failed to import image: {e}")
+            return
+        self.clipboard = {"w": w, "h": h, "data": data}
+        self.start_paste()
+
+    # ---------------------------------------------------------- events
+    def handle_event(self, e):
+        if e.type == pygame.QUIT:
+            if self.maybe_save_first():
+                self.running = False
+            return
+        if e.type == pygame.VIDEORESIZE:
+            self.screen = pygame.display.set_mode((max(e.w, UI_WIDTH + 400), max(e.h, 700)), pygame.RESIZABLE)
+            self.clamp_camera()
+        elif e.type == pygame.KEYDOWN:
+            self.on_key(e)
+        elif e.type == pygame.MOUSEBUTTONDOWN:
+            self.mouse = e.pos
+            self.on_mouse_down(e)
+        elif e.type == pygame.MOUSEBUTTONUP:
+            self.mouse = e.pos
+            self.on_mouse_up(e)
+        elif e.type == pygame.MOUSEMOTION:
+            self.mouse = e.pos
+            self.on_motion(e)
+        elif e.type == pygame.MOUSEWHEEL:
+            self.on_wheel(e)
+        elif e.type == pygame.DROPFILE:
+            if os.path.isdir(e.file) and self.maybe_save_first():
+                self.open_project(e.file)
+
+    def on_key(self, e):
+        k, mods = e.key, e.mod
+        ctrl, shift = mods & pygame.KMOD_CTRL, mods & pygame.KMOD_SHIFT
+        m = self.map
+        if k == pygame.K_F1:
+            self.show_help = not self.show_help
+        elif k == pygame.K_s:
+            self.save_all()
+        elif ctrl and k == pygame.K_z:
+            self.do_undo(redo=bool(shift))
+        elif ctrl and k == pygame.K_y:
+            self.do_undo(redo=True)
+        elif ctrl and k == pygame.K_c:
+            self.copy_selection()
+        elif ctrl and k == pygame.K_x:
+            self.cut_selection()
+        elif ctrl and k == pygame.K_v:
+            self.start_paste()
+        elif ctrl:
+            pass
+        elif k == pygame.K_t:
+            self.tool = TOOLS[(TOOLS.index(self.tool) + 1) % len(TOOLS)]
+            self.say(f"Tool: {self.tool}", 1500)
+        elif k == pygame.K_i:
+            self.import_image()
+        elif k == pygame.K_o:
+            self.open_dialog()
+        elif k == pygame.K_F5:
+            if self.root and self.maybe_save_first():
+                self.open_project(self.root)
+        elif k == pygame.K_g:
+            self.show_grid = not self.show_grid
+        elif k == pygame.K_b:
+            self.checker_bg = not self.checker_bg
+        elif k == pygame.K_f:
+            self.fit_view()
+        elif k == pygame.K_v and self.layer:
+            self.layer.visible = not self.layer.visible
+        elif k == pygame.K_e:
+            self.color = (self.color + 1) % 256
+        elif k == pygame.K_q:
+            self.color = (self.color - 1) % 256
+        elif k == pygame.K_LEFTBRACKET and m and m.layers:
+            self.set_layer((m.active - 1) % len(m.layers))
+        elif k == pygame.K_RIGHTBRACKET and m and m.layers:
+            self.set_layer((m.active + 1) % len(m.layers))
+        elif pygame.K_1 <= k <= pygame.K_9:
+            self.set_layer(k - pygame.K_1)
+        elif k in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
+            self.step_zoom(1)
+        elif k in (pygame.K_MINUS, pygame.K_KP_MINUS):
+            self.step_zoom(-1)
+        elif k == pygame.K_PAGEUP:
+            self.switch_map(self.mi - 1)
+        elif k == pygame.K_PAGEDOWN:
+            self.switch_map(self.mi + 1)
+        elif k in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN):
+            step = 96
+            self.ox += step if k == pygame.K_LEFT else -step if k == pygame.K_RIGHT else 0
+            self.oy += step if k == pygame.K_UP else -step if k == pygame.K_DOWN else 0
+            self.clamp_camera()
+        elif k == pygame.K_RETURN:
+            if self.is_pasting:
+                self.commit_paste()
+        elif k == pygame.K_DELETE:
+            if self.selection_box and self.editable():
+                self.clear_selection_pixels()
+        elif k == pygame.K_ESCAPE:
+            if self.is_pasting:
+                self.is_pasting = False
+                self.say("Paste canceled", 1500)
+            elif self.is_moving:
+                self.commit_move()
+            else:
+                self.selection_box = self.selection_start = None
+
+    def on_mouse_down(self, e):
+        L = self.layout()
+        pos, btn = e.pos, e.button
+        if btn in (2, 3) and L["view"].collidepoint(pos):
+            self.panning = True
+            return
+        if btn != 1:
+            return
+        if L["vbar"].collidepoint(pos):
+            self.drag_bar = "v"
+            self.drag_scroll("v", pos[1])
+        elif L["hbar"].collidepoint(pos):
+            self.drag_bar = "h"
+            self.drag_scroll("h", pos[0])
+        elif L["view"].collidepoint(pos):
+            self.canvas_click(pos)
+        elif pos[0] >= L["ux"]:
+            self.sidebar_click(pos, L)
+
+    def canvas_click(self, pos):
+        if not self.map or self.show_help:
+            return
+        wx, wy = self.to_world(pos)
+        mods = self.mods()
+        tool = self.tool
+        if self.selection_box and (mods & pygame.KMOD_CTRL) and (mods & pygame.KMOD_ALT) \
+                and not self.is_pasting and not self.is_moving:
+            self.start_move(wx, wy)
+        elif self.is_pasting:
+            self.commit_paste()
+        elif tool == "select":
+            self.selection_start = (wx, wy)
+            self.selection_box = None
+            self.update_selection(pos)
+        elif tool == "picker":
+            self.pick_color(wx, wy)
+        elif not self.editable():
+            return
+        elif tool in ("draw", "eraser"):
+            self.map.begin()
+            self.stroking = True
+            self.last = None
+            self.stroke_to(wx, wy)
+        elif tool == "bucket":
+            self.do_fill(wx, wy)
+
+    def sidebar_click(self, pos, L):
+        pal = L["pal"]
+        if pal.collidepoint(pos):
+            c = L["cell"]
+            self.color = ((pos[1] - pal.y) // c) * 16 + (pos[0] - pal.x) // c
+            return
+        for i, r, eye in L["layer_rows"]:
+            if r.collidepoint(pos):
+                if eye.collidepoint(pos):
+                    self.map.layers[i].visible = not self.map.layers[i].visible
+                else:
+                    self.set_layer(i)
+                return
+        for i, r in L["map_rows"]:
+            if r.collidepoint(pos):
+                self.switch_map(i)
+                return
+        actions = [self.open_dialog, self.import_image, self.save_all]
+        for r, act in zip(L["buttons"], actions):
+            if r.collidepoint(pos):
+                act()
+                return
+
+    def on_mouse_up(self, e):
+        if e.button in (2, 3):
+            self.panning = False
+        elif e.button == 1:
+            self.drag_bar = None
+            if self.is_moving:
+                self.commit_move()
+            elif self.stroking:
+                self.stroking = False
+                self.last = None
+                self.map.end()
+            elif self.tool == "select" and self.selection_start:
+                self.update_selection(e.pos)
+                self.selection_start = None
+
+    def on_motion(self, e):
+        if self.drag_bar:
+            self.drag_scroll(self.drag_bar, e.pos[1] if self.drag_bar == "v" else e.pos[0])
+        elif self.panning:
+            self.ox += e.rel[0]
+            self.oy += e.rel[1]
+            self.clamp_camera()
+        elif self.is_moving:
+            wx, wy = self.to_world(e.pos)
+            self.move_x, self.move_y = wx - self.grab_ox, wy - self.grab_oy
+        elif self.is_pasting:
+            self.paste_x, self.paste_y = self.to_world(e.pos)
+        elif self.stroking:
+            self.stroke_to(*self.to_world(e.pos))
+        elif self.selection_start and self.tool == "select":
+            self.update_selection(e.pos)
+
+    def on_wheel(self, e):
+        L = self.layout()
+        if not L["view"].collidepoint(self.mouse):
+            return
+        mods = self.mods()
+        if mods & pygame.KMOD_CTRL:
+            self.step_zoom(1 if e.y > 0 else -1 if e.y < 0 else 0, self.mouse)
+            return
+        if mods & pygame.KMOD_SHIFT:
+            self.ox += e.y * 35
+        else:
+            self.oy += e.y * 35
+        self.ox -= e.x * 35
+        self.clamp_camera()
+
+    # ---------------------------------------------------------- drawing
+    def text(self, s, pos, color=(200, 200, 200), font=None):
+        self.screen.blit((font or self.font).render(s, True, color), pos)
+
+    def clip_text(self, s, width):
+        if self.font.size(s)[0] <= width:
+            return s
+        while s and self.font.size(s + "...")[0] > width:
+            s = s[:-1]
+        return s + "..."
+
+    def blit_crop(self, surf, sx, sy, w, h):
+        """Blit an (integer zoom >= 1) scaled copy of just the part of `surf` that is on screen."""
+        z = self.zoom
+        view = self.layout()["view"]
+        ix0, iy0 = max(0, (view.left - sx) // z), max(0, (view.top - sy) // z)
+        ix1, iy1 = min(w, -((sx - view.right) // z)), min(h, -((sy - view.bottom) // z))
+        if ix1 <= ix0 or iy1 <= iy0:
+            return
+        sub = surf.subsurface((ix0, iy0, ix1 - ix0, iy1 - iy0))
+        self.screen.blit(pygame.transform.scale(sub, ((ix1 - ix0) * z, (iy1 - iy0) * z)),
+                         (sx + ix0 * z, sy + iy0 * z))
+
+    def blit_world(self, surf, wx, wy):
+        w, h = surf.get_size()
+        sx, sy = self.to_screen(wx, wy)
+        if self.zoom >= 1:
+            self.blit_crop(surf, sx, sy, w, h)
+        else:
+            sc = pygame.transform.scale(surf, (max(1, int(w * self.zoom)), max(1, int(h * self.zoom))))
+            self.screen.blit(sc, (sx, sy))
+
+    def data_surface(self, data, w, h):
+        key = (id(data), w, h)
+        if not self._ghost or self._ghost[0] != key:
+            s = pygame.image.frombuffer(data, (w, h), "P")
+            s.set_palette(palette_rgb)
+            s.set_colorkey(0)
+            self._ghost = (key, s, data)
+        return self._ghost[1]
+
+    def checker_surface(self):
+        if self._checker is None:
+            buf = bytes(1 if ((i % TILE_W) // 8 + (i // TILE_W) // 8) % 2 else 0 for i in range(TILE_BYTES))
+            s = pygame.image.frombuffer(buf, (TILE_W, TILE_H), "P")
+            s.set_palette([(58, 58, 58), (88, 88, 88)] + [(0, 0, 0)] * 254)
+            self._checker = (s, buf)
+        return self._checker[0]
+
+    def visible_cells(self, view):
+        z = self.zoom
+        cw, ch = TILE_W * z, TILE_H * z
+        x0 = max(0, int((view.left - self.ox) // cw))
+        y0 = max(0, int((view.top - self.oy) // ch))
+        x1 = min(MAX_CELL, int((view.right - self.ox) // cw))
+        y1 = min(MAX_CELL, int((view.bottom - self.oy) // ch))
+        return x0, y0, x1, y1
+
+    def draw_canvas(self, L):
+        scr, view, z = self.screen, L["view"], self.zoom
+        scr.set_clip(view)
+        scr.fill((25, 25, 25))
+        m = self.map
+        if m is None:
+            self.text("Press O (or the button) to open a project folder", (30, 30), (220, 220, 220), self.font_bold)
+            scr.set_clip(None)
+            return
+        vx0, vy0, vx1, vy1 = self.visible_cells(view)
+        bb = m.cells_bbox()
+        if bb:
+            bx, by = self.to_screen(bb[0] * TILE_W, bb[1] * TILE_H)
+            bw, bh = int((bb[2] - bb[0] + 1) * TILE_W * z), int((bb[3] - bb[1] + 1) * TILE_H * z)
+            pygame.draw.rect(scr, (0, 0, 0), (bx, by, bw, bh))
+            if self.checker_bg:
+                chk = self.checker_surface()
+                for cy in range(max(vy0, bb[1]), min(vy1, bb[3]) + 1):
+                    for cx in range(max(vx0, bb[0]), min(vx1, bb[2]) + 1):
+                        self.blit_world(chk, cx * TILE_W, cy * TILE_H)
+        for layer in m.layers:
+            if not layer.visible:
+                continue
+            for cy in range(vy0, vy1 + 1):
+                for cx in range(vx0, vx1 + 1):
+                    t = layer.tiles.get((cx, cy))
+                    if t is None:
+                        continue
+                    sx, sy = self.to_screen(cx * TILE_W, cy * TILE_H)
+                    if z < 1:
+                        scr.blit(t.scaled(z), (sx, sy))
+                    else:
+                        self.blit_crop(t.surface(), sx, sy, TILE_W, TILE_H)
+        if self.show_grid:
+            self.draw_grid(L, bb, vx0, vy0, vx1, vy1)
+        # paste / move ghosts
+        if self.is_pasting and self.clipboard:
+            c = self.clipboard
+            self.blit_world(self.data_surface(c["data"], c["w"], c["h"]), self.paste_x, self.paste_y)
+            sx, sy = self.to_screen(self.paste_x, self.paste_y)
+            pygame.draw.rect(scr, (255, 255, 255), (sx, sy, int(c["w"] * z), int(c["h"] * z)), 1)
+            self.size_label(sx, sy, c["w"], c["h"], (255, 255, 255))
+        if self.is_moving and self.move_buffer:
+            b = self.move_buffer
+            self.blit_world(self.data_surface(b["data"], b["w"], b["h"]), self.move_x, self.move_y)
+            sx, sy = self.to_screen(self.move_x, self.move_y)
+            pygame.draw.rect(scr, (255, 180, 0), (sx, sy, int(b["w"] * z), int(b["h"] * z)), 2)
+            self.size_label(sx, sy, b["w"], b["h"], (255, 180, 0))
+        if self.selection_box and not self.is_pasting and not self.is_moving:
+            x, y, w, h = self.selection_box
+            sx, sy = self.to_screen(x, y)
+            pygame.draw.rect(scr, (0, 255, 255), (sx, sy, max(2, int(w * z)), max(2, int(h * z))), 2)
+            self.size_label(sx, sy, w, h, (0, 255, 255))
+        # pixel cursor
+        if view.collidepoint(self.mouse) and not (self.is_pasting or self.is_moving):
+            wx, wy = self.to_world(self.mouse)
+            if wx >= 0 and wy >= 0:
+                sx, sy = self.to_screen(wx, wy)
+                col = {"draw": (255, 255, 0), "eraser": (255, 0, 255), "bucket": (0, 150, 255),
+                       "picker": (0, 255, 128)}.get(self.tool, (0, 255, 255))
+                size = max(2, int(z))
+                pygame.draw.rect(scr, col, (sx, sy, size, size), 1)
+        scr.set_clip(None)
+        self.draw_scrollbars(L)
+        # status line
+        if self.status and pygame.time.get_ticks() < self.status_until:
+            t = self.font.render(self.status, True, (255, 255, 255))
+            r = t.get_rect(bottomleft=(8, view.bottom - 6))
+            r = r.clip(view) if r.width > view.w - 16 else r
+            pygame.draw.rect(scr, (20, 20, 20), r.inflate(10, 6))
+            scr.blit(t, r, area=pygame.Rect(0, 0, view.w - 20, r.h))
+
+    def draw_grid(self, L, bb, vx0, vy0, vx1, vy1):
+        scr, z = self.screen, self.zoom
+        if bb is None:
+            bb = (0, 0, 0, 0)
+        gx0, gy0 = max(0, bb[0] - 1), max(0, bb[1] - 1)
+        gx1, gy1 = min(MAX_CELL, bb[2] + 1), min(MAX_CELL, bb[3] + 1)
+        cw, ch = TILE_W * z, TILE_H * z
+        left, top = self.to_screen(gx0 * TILE_W, gy0 * TILE_H)
+        right, bottom = self.to_screen((gx1 + 1) * TILE_W, (gy1 + 1) * TILE_H)
+        for cx in range(gx0, gx1 + 2):
+            x = int(left + (cx - gx0) * cw)
+            pygame.draw.line(scr, (70, 70, 110), (x, top), (x, bottom))
+        for cy in range(gy0, gy1 + 2):
+            y = int(top + (cy - gy0) * ch)
+            pygame.draw.line(scr, (70, 70, 110), (left, y), (right, y))
+        if self.map.cells_bbox():
+            bx, by = self.to_screen(bb[0] * TILE_W, bb[1] * TILE_H)
+            pygame.draw.rect(scr, (120, 120, 210), (bx, by, int((bb[2] - bb[0] + 1) * cw), int((bb[3] - bb[1] + 1) * ch)), 2)
+        layer = self.layer
+        if cw >= 34:
+            for cy in range(max(vy0, gy0), min(vy1, gy1) + 1):
+                for cx in range(max(vx0, gx0), min(vx1, gx1) + 1):
+                    has = layer is not None and (cx, cy) in layer.tiles
+                    sx, sy = self.to_screen(cx * TILE_W, cy * TILE_H)
+                    t = self.font_small.render(f"{cx},{cy}", True, (255, 220, 80) if has else (130, 130, 130))
+                    pygame.draw.rect(scr, (20, 20, 20), (sx + 2, sy + 2, t.get_width() + 6, t.get_height() + 2))
+                    scr.blit(t, (sx + 5, sy + 3))
+        # highlight the screen under the mouse
+        if L["view"].collidepoint(self.mouse):
+            wx, wy = self.to_world(self.mouse)
+            if wx >= 0 and wy >= 0 and wx // TILE_W <= MAX_CELL and wy // TILE_H <= MAX_CELL:
+                sx, sy = self.to_screen((wx // TILE_W) * TILE_W, (wy // TILE_H) * TILE_H)
+                pygame.draw.rect(scr, (0, 200, 255), (sx, sy, int(cw), int(ch)), 1)
+
+    def size_label(self, x, y, w, h, color):
+        surf = self.font_small.render(f"{w}x{h}", True, color)
+        r = surf.get_rect(topleft=(x, y - 18)).inflate(6, 4)
+        pygame.draw.rect(self.screen, (20, 20, 20), r)
+        pygame.draw.rect(self.screen, color, r, 1)
+        self.screen.blit(surf, (r.x + 3, r.y + 2))
+
+    def draw_scrollbars(self, L):
+        scr = self.screen
+        for axis, rect in (("v", L["vbar"]), ("h", L["hbar"])):
+            pygame.draw.rect(scr, (35, 35, 35), rect)
+            g = self.bar_geom(axis) if self.map else None
+            if g:
+                track, thumb, frac, *_ = g
+                off = int(frac * (track - thumb))
+                tr = (rect.x + 2, rect.y + off + 2, rect.w - 4, thumb - 4) if axis == "v" \
+                    else (rect.x + off + 2, rect.y + 2, thumb - 4, rect.h - 4)
+                pygame.draw.rect(scr, (100, 100, 100), tr, border_radius=3)
+        pygame.draw.rect(scr, (30, 30, 30), (L["ux"] - SB, L["h"] - SB, SB, SB))
+
+    def draw_sidebar(self, L):
+        scr = self.screen
+        ux, h = L["ux"], L["h"]
+        pygame.draw.rect(scr, (40, 40, 40), (ux, 0, UI_WIDTH, h))
+        pygame.draw.line(scr, (80, 80, 80), (ux, 0), (ux, h), 2)
+        m, layer = self.map, self.layer
+        bx = ux + 15
+        wx = wy = None
+        if L["view"].collidepoint(self.mouse):
+            wx, wy = self.to_world(self.mouse)
+        lines = [
+            f"Project: {os.path.basename(self.root) or self.root}" if self.root else "Project: (none - press O)",
+            f"Map: {m.name}  ({self.mi + 1}/{len(self.maps)})" if m else "Map: -",
+            f"Layer: .{layer.disp}{'  (HIDDEN)' if not layer.visible else ''}" if layer else "Layer: -",
+            f"Tool: {self.tool.upper()} (T)",
+            f"Color: {self.color} (0x{self.color:02X}){'  = transparent' if self.color == 0 else ''}",
+            f"Zoom: {self.zoom:g}x",
+            "Cursor: -", "Screen: -", "File: -", "Pixel: -",
+        ]
+        if wx is not None and wx >= 0 and wy >= 0:
+            cx, cy = wx // TILE_W, wy // TILE_H
+            lines[6] = f"Cursor: world {wx},{wy}"
+            lines[7] = f"Screen: {cx},{cy}   local {wx % TILE_W},{wy % TILE_H}"
+            if layer and m:
+                has = (cx, cy) in layer.tiles
+                lines[8] = f"File: {cx},{cy}.{layer.disp}  " + ("exists" if has else "none yet (made on paint)")
+                seen = 0
+                for l in reversed(m.layers):
+                    if l.visible and m.get_px(l, wx, wy):
+                        seen = m.get_px(l, wx, wy)
+                        break
+                lines[9] = f"Pixel: 0x{m.get_px(layer, wx, wy):02X} layer, 0x{seen:02X} seen"
+        lines.append(f"Unsaved: {self.dirty_count()} file(s)")
+        lines.append("F1 = all controls")
+        for i, t in enumerate(lines):
+            self.text(self.clip_text(t, UI_WIDTH - 30), (bx, 12 + i * 17), (255, 255, 255) if i < 4 else (200, 200, 200))
+        if m:
+            self.text("Layers (click = edit, box = show):", (bx, L["layers_hdr"]), (150, 150, 150))
+            for i, r, eye in L["layer_rows"]:
+                l = m.layers[i]
+                if i == m.active:
+                    pygame.draw.rect(scr, (60, 80, 110), r)
+                pygame.draw.rect(scr, (200, 200, 200), (eye.x + 3, eye.y + 3, 11, 11), 1)
+                if l.visible:
+                    pygame.draw.rect(scr, (120, 220, 120), (eye.x + 5, eye.y + 5, 7, 7))
+                n_dirty = sum(1 for t in l.tiles.values() if t.dirty)
+                self.text(self.clip_text(f"{i + 1}  .{l.disp}   {len(l.tiles)} screens" + (f"  ({n_dirty} unsaved)" if n_dirty else ""), r.w - 30),
+                          (r.x + 26, r.y + 1), (255, 255, 255) if i == m.active else (200, 200, 200))
+        if L["map_rows"]:
+            self.text(f"Maps (click, PgUp/PgDn)  {L['map_first'] + 1}-{L['map_first'] + len(L['map_rows'])} of {L['map_n']}",
+                      (bx, L["maps_hdr"]), (150, 150, 150))
+            for i, r in L["map_rows"]:
+                if i == self.mi:
+                    pygame.draw.rect(scr, (60, 80, 110), r)
+                mp = self.maps[i]
+                d = mp.dirty_count()
+                self.text(self.clip_text(mp.name + (f"  ({d} unsaved)" if d else ""), r.w - 8), (r.x + 4, r.y + 1),
+                          (255, 255, 255) if i == self.mi else (200, 200, 200))
+        pal, c = L["pal"], L["cell"]
+        for i in range(256):
+            r = pygame.Rect(pal.x + (i % 16) * c, pal.y + (i // 16) * c, c - 1, c - 1)
+            pygame.draw.rect(scr, palette_rgb[i], r)
+        pygame.draw.rect(scr, (255, 255, 255),
+                         (pal.x + (self.color % 16) * c - 1, pal.y + (self.color // 16) * c - 1, c + 1, c + 1), 2)
+        for (label, col), r in zip((("OPEN FOLDER (O)", (70, 130, 70)), ("IMPORT IMAGE (I)", (130, 70, 140)),
+                                    ("SAVE ALL (S)", (70, 70, 140))), L["buttons"]):
+            pygame.draw.rect(scr, col, r, border_radius=4)
+            pygame.draw.rect(scr, (200, 200, 200), r, 1, border_radius=4)
+            t = self.font.render(label, True, (255, 255, 255))
+            scr.blit(t, t.get_rect(center=r.center))
+
+    def draw_help(self, L):
+        panel = pygame.Rect(0, 0, 640, 30 + len(HELP_LINES) * 20)
+        panel.center = L["view"].center
+        veil = pygame.Surface(panel.size, pygame.SRCALPHA)
+        veil.fill((15, 15, 25, 235))
+        self.screen.blit(veil, panel)
+        pygame.draw.rect(self.screen, (120, 120, 200), panel, 1)
+        for i, line in enumerate(HELP_LINES):
+            self.text(line, (panel.x + 16, panel.y + 15 + i * 20), (255, 255, 255) if i == 0 else (215, 215, 215))
+
+    def draw(self):
+        L = self.layout()
+        self.draw_canvas(L)
+        self.draw_sidebar(L)
+        if self.show_help:
+            self.draw_help(L)
+        cap = "worldr" + (f" - {os.path.basename(self.root)} / {self.map.name}" if self.map else "")
+        if self.dirty_count():
+            cap += " *"
+        if cap != self._caption:
+            pygame.display.set_caption(cap)
+            self._caption = cap
+        pygame.display.flip()
+
+    # ---------------------------------------------------------- main loop
+    def startup(self, path):
+        if path:
+            self.open_project(path)
+            return
+        if self.open_project(os.getcwd()):
+            return
+        p = self.ask_folder()
+        if p:
+            self.open_project(p)
+
+    def run(self):
+        while self.running:
+            for e in pygame.event.get():
+                self.handle_event(e)
+            m = self.map
+            if m and m.cur is not None and not (self.stroking or self.is_moving):
+                m.end()                     # a mouse-up we never saw (released outside the window)
+            if self.tkroot:
+                try:
+                    self.tkroot.update()
+                except tk.TclError:
+                    pass
+            self.draw()
+            self.clock.tick(60)
+        pygame.quit()
+
+
+def main():
+    app = App()
+    app.startup(sys.argv[1] if len(sys.argv) > 1 else None)
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
