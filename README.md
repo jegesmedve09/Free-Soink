@@ -8,6 +8,10 @@ I OWN THE ASSETS< THE CODE< BUT NOT THE IDEA. </br>
 ALL RIGHT RESERVED. </br>
 HAIL SEGA! </br>
  </br>
+ #Game is made by ScaMa™ (ScanlineMafia). An indie dev group.</br>
+ #Game is under my name, because i am the lead programmer, leader
+ #and the representative of the group</br>
+ </br>
 # Detaili: </br>
 --SYSTEM = CODENAME </br>
 Linux = FREA </br>
