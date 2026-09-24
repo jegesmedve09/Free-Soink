@@ -9,7 +9,7 @@ ALL RIGHT RESERVED. </br>
 HAIL SEGA! </br>
  </br>
  #Game is made by ScaMa™ (ScanlineMafia). An indie dev group.</br>
- #Game is under my name, because i am the lead programmer, leader
+ #Game is under my name, because i am the lead programmer, leader</br>
  #and the representative of the group</br>
  </br>
 # Detaili: </br>
